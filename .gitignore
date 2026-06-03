@@ -1,0 +1,10 @@
+# 隧道列表（含个人 notebook URL / session ID，不公开）
+tunnels.json
+tunnels.json.tmp
+
+# 历史数据目录（早期版本会创建在这里）
+data/
+
+# 系统垃圾
+.DS_Store
+.omc/
