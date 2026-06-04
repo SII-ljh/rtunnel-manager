@@ -14,6 +14,7 @@
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -219,6 +220,35 @@ function probeUrl(rawUrl, timeoutMs = 6000) {
   });
 }
 
+// 端到端 SSH 探测：TCP 连本地隧道端口，读首包看是否是 SSH 协议头（"SSH-2.0-..."）。
+// 这条链路要走完整路径：本地 rtunnel → 远程网关 → 远程 sshd。任何一环断（远程关机
+// 最常见）都会拿不到 banner。比 probeUrl 准——proxy 网关常在远端宕机时仍返回 200。
+function probeSshBanner(port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch (_) {}
+      resolve(result);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('data', (chunk) => {
+      const banner = chunk.toString('utf8', 0, Math.min(chunk.length, 64));
+      if (banner.startsWith('SSH-')) {
+        finish({ ok: true, banner: banner.split(/\r?\n/)[0] });
+      } else {
+        finish({ ok: false, reason: 'TCP 已连通但未收到 SSH 协议头' });
+      }
+    });
+    socket.on('timeout', () => finish({ ok: false, reason: `SSH 探测超时（${timeoutMs}ms），远程服务器可能已关机或断网` }));
+    socket.on('error', (err) => finish({ ok: false, reason: `无法建立 SSH 连接: ${err.message}` }));
+    socket.on('close', () => finish({ ok: false, reason: '连接被对端关闭，未收到 SSH 协议头' }));
+    socket.connect(port, '127.0.0.1');
+  });
+}
+
 // ---------- 远程健康检查 ----------
 // rtunnel 是「懒连接」：本地进程存活 ≠ 远程可达（远程关机后客户端进程照样活着，
 // 只在真正有连接时才会拨远程并失败）。所以只看 pid 检测不出远程关机。
@@ -226,19 +256,21 @@ function probeUrl(rawUrl, timeoutMs = 6000) {
 const health = new Map(); // id -> { reachable: bool, checkedAt: iso, reason: string|null }
 
 async function checkOne(t) {
-  const probe = await probeUrl(t.url, 6000);
-  let reachable, reason = null;
-  if (!probe.ok) {
-    reachable = false;
-    reason = probe.reason;
-  } else if (probe.status >= 500) {
-    // 网关在，但后端（你的服务器/notebook）多半已下线
-    reachable = false;
-    reason = `远程返回 ${probe.status}（后端可能已下线）`;
-  } else {
-    reachable = true;
+  // 主信号：端到端 SSH banner 探测。能拿到 SSH-banner 说明整条链路都通。
+  const ssh = await probeSshBanner(t.port, 5000);
+  if (ssh.ok) {
+    health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
+    return;
   }
-  health.set(t.id, { reachable, checkedAt: new Date().toISOString(), reason });
+  // SSH 探测失败 → 再探一次代理 URL，把原因说得更具体一点（究竟是网关挂了，还是后端挂了）
+  let reason = ssh.reason;
+  try {
+    const probe = await probeUrl(t.url, 6000);
+    if (!probe.ok) reason = `远程网关不可达：${probe.reason}`;
+    else if (probe.status >= 500) reason = `远程网关返回 ${probe.status}（后端可能已下线）`;
+    // 网关 2xx/3xx/4xx 但 SSH 拿不到 → 远程主机大概率关机，保留 ssh.reason
+  } catch (_) { /* URL 探测异常忽略，沿用 ssh.reason */ }
+  health.set(t.id, { reachable: false, checkedAt: new Date().toISOString(), reason });
 }
 
 // 探测所有运行中的隧道；非运行的清掉其健康记录。
@@ -512,8 +544,10 @@ const server = http.createServer(async (req, res) => {
         const result = await startTunnel(t);
         saveTunnels(tunnels);
         if (!result.ok) return sendJson(res, 500, { error: result.reason });
-        // 启动门刚确认过远程可达，直接据此初始化健康状态
+        // 启动门刚确认过远程网关可达，乐观初始化为"运行中、可达"；
+        // 2s 后做一次真正的端到端 SSH 探测，远程若已关机会很快翻成「已断开」。
         health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
+        setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
     }
@@ -538,7 +572,10 @@ const HTML_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="SII-ljh">
+<meta name="generator" content="rtunnel-manager · ljh">
 <title>rtunnel 管理器</title>
+<!-- crafted by SII-ljh · https://github.com/SII-ljh -->
 <style>
   :root {
     --bg: #f7f8fa; --card: #ffffff; --line: #e8eaed; --text: #1f2329;
@@ -609,6 +646,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
   #toast.err { background: #b91c1c; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .signoff { text-align: center; margin-top: 36px; font-size: 11px; color: var(--muted); letter-spacing: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .42; user-select: none; transition: opacity .25s; }
+  .signoff:hover { opacity: .85; }
+  .signoff a { color: inherit; text-decoration: none; }
   @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } .row { grid-template-columns: 1fr; } .actions { justify-content: flex-start; } }
 </style>
 </head>
@@ -634,6 +674,8 @@ const HTML_PAGE = `<!DOCTYPE html>
   </div>
 
   <div class="card list" id="list"></div>
+
+  <footer class="signoff" title="rtunnel 管理器 · by SII-ljh"><a href="https://github.com/SII-ljh" target="_blank" rel="noopener">· ljh ·</a></footer>
 </div>
 <div id="toast"></div>
 
@@ -673,14 +715,14 @@ function render(tunnels) {
     // 运行中但远程探测失败 → 远程不可达（远程关机 / 断网 / 后端下线）
     const unreachable = running && t.reachable === false;
     const badge = unreachable
-      ? '<span class="badge unreachable" title="'+esc(t.checkReason||'远程探测失败')+'">远程不可达</span>'
+      ? '<span class="badge unreachable" title="'+esc(t.checkReason||'SSH 探测失败：远程服务器可能已关机')+'">已断开</span>'
       : '<span class="badge '+(running?'running':'stopped')+'">'+(running?'运行中':'已停止')+'</span>';
     return \`
     <div class="row">
       <div class="info">
         <div class="name">\${esc(t.name)} \${badge}\${t.pid?'<span class="sub" style="color:var(--muted);font-size:11px">pid '+t.pid+'</span>':''}</div>
         <div class="url" title="\${esc(t.url)}">\${esc(t.url)}\${t.args?'  ·  '+esc(t.args):''}</div>
-        <div class="ssh \${running&&!unreachable?'ready':'off'}" data-cmd="\${esc(ssh)}" title="点击复制 ssh 指令">\${esc(ssh)} <span class="copy">\${unreachable?'远程不可达':(running?'点击复制':'未运行')}</span></div>
+        <div class="ssh \${running&&!unreachable?'ready':'off'}" data-cmd="\${esc(ssh)}" title="点击复制 ssh 指令">\${esc(ssh)} <span class="copy">\${unreachable?'已断开':(running?'点击复制':'未运行')}</span></div>
       </div>
       <div class="actions">
         \${running
