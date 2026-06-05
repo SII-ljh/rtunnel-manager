@@ -286,6 +286,88 @@ async function runHealthChecks() {
   })));
 }
 
+// ---------- GPU 使用情况 ----------
+// 节点已配置免密公钥，可非交互式 SSH 进去跑 nvidia-smi。结果存内存（不写盘）：
+//   gpuStats: id -> { gpus: [...], queriedAt: iso, error: string|null }
+// gpus 每项: { index, name, util(%), memUsed(MiB), memTotal(MiB), temp(℃), power(W) }
+const gpuStats = new Map();
+
+const NVIDIA_QUERY = 'nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits';
+
+// 隧道连的都是 127.0.0.1:<port>，同一端口被不同节点复用会触发 known_hosts 冲突；
+// localhost 隧道场景主机密钥校验意义不大，直接绕过。BatchMode 确保免密不可用时
+// 快速失败而非挂起等密码。
+function gpuSshArgs(t) {
+  return [
+    '-p', String(t.port),
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=5',
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'LogLevel=ERROR',
+    `${t.user || 'root'}@127.0.0.1`,
+    NVIDIA_QUERY,
+  ];
+}
+
+// 把 nvidia-smi 的 CSV 行解析成数字字段；解析不出的字段留 null。
+function parseGpuCsv(stdout) {
+  const num = (s) => {
+    const v = parseFloat(s);
+    return Number.isFinite(v) ? v : null;
+  };
+  return stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const c = line.split(',').map((x) => x.trim());
+      return {
+        index: num(c[0]),
+        name: c[1] || '',
+        util: num(c[2]),
+        memUsed: num(c[3]),
+        memTotal: num(c[4]),
+        temp: num(c[5]),
+        power: num(c[6]),
+      };
+    });
+}
+
+function queryGpu(t) {
+  return new Promise((resolve) => {
+    execFile('ssh', gpuSshArgs(t), {
+      timeout: 8000,
+      env: childEnvWithoutProxy(),
+      maxBuffer: 1 << 20,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        // 无 nvidia-smi / 连接失败 / 超时 —— 记原因，gpus 留空，前端不展示。
+        const reason = (stderr || err.message || '').trim().split(/\r?\n/)[0] || 'GPU 查询失败';
+        gpuStats.set(t.id, { gpus: [], queriedAt: new Date().toISOString(), error: reason });
+        resolve();
+        return;
+      }
+      const gpus = parseGpuCsv(stdout);
+      gpuStats.set(t.id, { gpus, queriedAt: new Date().toISOString(), error: gpus.length ? null : '未解析到 GPU' });
+      resolve();
+    });
+  });
+}
+
+// 查所有运行中隧道的 GPU；非运行的清掉记录。
+async function runGpuChecks() {
+  const tunnels = reconcile(loadTunnels());
+  const running = [];
+  for (const t of tunnels) {
+    if (t.status === 'running') running.push(t);
+    else gpuStats.delete(t.id);
+  }
+  await Promise.all(running.map((t) => queryGpu(t).catch(() => {
+    gpuStats.set(t.id, { gpus: [], queriedAt: new Date().toISOString(), error: 'GPU 查询异常' });
+  })));
+}
+
 // rtunnel 子进程会剔除代理变量（见 childEnvWithoutProxy），始终直连运行——
 // 不影响你 shell 里给其它程序用的代理。这里只做一次「直连可达」探测：
 // 探测本身不走代理（Node 原生请求不读代理环境变量），连得上才放行，否则拒绝。
@@ -418,6 +500,7 @@ function readBody(req) {
 function publicView(tunnels) {
   return tunnels.map((t) => {
     const h = health.get(t.id);
+    const g = gpuStats.get(t.id);
     return {
       id: t.id,
       name: t.name,
@@ -432,6 +515,8 @@ function publicView(tunnels) {
       reachable: t.status === 'running' && h ? h.reachable : null,
       checkedAt: h ? h.checkedAt : null,
       checkReason: h ? h.reason : null,
+      // GPU 使用情况：null = 未查 / 非运行；否则 { gpus, queriedAt, error }
+      gpu: t.status === 'running' && g ? g : null,
     };
   });
 }
@@ -548,6 +633,8 @@ const server = http.createServer(async (req, res) => {
         // 2s 后做一次真正的端到端 SSH 探测，远程若已关机会很快翻成「已断开」。
         health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
         setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
+        // 顺带查一次 GPU，前端展开时立刻有数据（不必等下一轮 15s 轮询）
+        setTimeout(() => { queryGpu(t).catch(() => {}); }, 2000);
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
     }
@@ -640,6 +727,20 @@ const HTML_PAGE = `<!DOCTYPE html>
   .ssh.ready .copy { color: var(--accent); }
   .ssh.off { opacity: .65; }
   .ssh.off .copy { color: var(--muted); }
+  /* GPU 行内概览 */
+  .gpu-sum { margin-top: 8px; display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: #3730a3; background: #f1f0fe; border: 1px solid #e0ddfb; border-radius: 7px; padding: 5px 10px; cursor: pointer; transition: background .15s; }
+  .gpu-sum:hover { background: #e8e6fd; }
+  .gpu-sum .gpu-icon { font-size: 12px; }
+  .gpu-sum .gpu-toggle { color: var(--muted); font-size: 11px; font-weight: 600; margin-left: 2px; }
+  .gpu-err { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  /* GPU 明细表 */
+  .gpu-table { margin-top: 8px; border-collapse: collapse; font-size: 12px; width: 100%; max-width: 560px; }
+  .gpu-table th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
+  .gpu-table td { padding: 5px 10px 5px 0; border-bottom: 1px solid #f1f2f4; vertical-align: middle; white-space: nowrap; }
+  .gpu-table tr:last-child td { border-bottom: none; }
+  .gpu-meter { display: inline-block; vertical-align: middle; width: 56px; height: 6px; border-radius: 4px; background: #ececf5; margin-left: 7px; overflow: hidden; }
+  .gpu-meter > i { display: block; height: 100%; background: var(--accent); }
+  .gpu-meter.hot > i { background: var(--red); }
   .actions { display: flex; gap: 6px; align-items: center; }
   .empty { text-align: center; color: var(--muted); padding: 40px 0; }
   #toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); max-width: 80%; background: #1f2329; color: #fff; padding: 11px 16px; border-radius: 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.18); opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s; white-space: pre-wrap; }
@@ -684,6 +785,7 @@ const $ = (id) => document.getElementById(id);
 let toastTimer = null;
 let editingId = null;        // 正在编辑的隧道 id（编辑期间暂停自动刷新覆盖）
 let lastTunnels = [];        // 最近一次的隧道数据（取消编辑时用来重绘）
+const gpuExpanded = new Set(); // 已展开 GPU 明细的隧道 id（前端态，定时刷新不丢）
 function toast(msg, isErr) {
   const el = $('toast');
   el.textContent = msg;
@@ -701,6 +803,66 @@ async function api(url, opts) {
 }
 
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// 去掉型号里冗长的前缀/后缀，留个好认的短名：
+// "NVIDIA A100-SXM4-40GB" -> "A100-SXM4-40GB"，"Tesla V100" -> "Tesla V100"
+function gpuShortName(name) { return String(name || '').replace(/^NVIDIA\\s+/i, '').trim() || 'GPU'; }
+
+// 从一组卡算出行内汇总：卡数、统一型号（不统一则记 GPU）、总显存占用率、平均利用率。
+function gpuSummary(gpus) {
+  const count = gpus.length;
+  const names = gpus.map((x) => gpuShortName(x.name));
+  const model = names.every((n) => n === names[0]) ? names[0] : 'GPU';
+  const memUsed = gpus.reduce((s, x) => s + (x.memUsed || 0), 0);
+  const memTotal = gpus.reduce((s, x) => s + (x.memTotal || 0), 0);
+  const memPct = memTotal ? Math.round((memUsed / memTotal) * 100) : null;
+  const utils = gpus.map((x) => x.util).filter((v) => v != null);
+  const avgUtil = utils.length ? Math.round(utils.reduce((a, b) => a + b, 0) / utils.length) : null;
+  return { count, model, memPct, avgUtil };
+}
+
+// 一个 0-100 的小进度条；>=85% 标红。
+function meter(pct, hot) {
+  if (pct == null) return '';
+  const w = Math.max(0, Math.min(100, pct));
+  return '<span class="gpu-meter'+(hot && w >= 85 ? ' hot' : '')+'"><i style="width:'+w+'%"></i></span>';
+}
+
+// 单块卡的明细表。
+function gpuDetailHtml(gpus) {
+  const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
+  const rows = gpus.map((x) => {
+    const memPct = (x.memUsed != null && x.memTotal) ? Math.round((x.memUsed / x.memTotal) * 100) : null;
+    return \`<tr>
+      <td>\${x.index == null ? '—' : x.index}</td>
+      <td>\${esc(gpuShortName(x.name))}</td>
+      <td>\${x.util == null ? '—' : x.util + '%'}\${meter(x.util, false)}</td>
+      <td>\${gb(x.memUsed)}/\${gb(x.memTotal)} GB\${meter(memPct, true)}</td>
+      <td>\${x.temp == null ? '—' : x.temp + '℃'}</td>
+      <td>\${x.power == null ? '—' : Math.round(x.power) + 'W'}</td>
+    </tr>\`;
+  }).join('');
+  return \`<table class="gpu-table">
+    <thead><tr><th>#</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr></thead>
+    <tbody>\${rows}</tbody>
+  </table>\`;
+}
+
+// 隧道行里的 GPU 区块：运行中且查到卡 → 概览行（可点开明细）；查询出错则静默不显示。
+function gpuBlockHtml(t) {
+  const g = t.gpu;
+  if (!g || !g.gpus || !g.gpus.length) return '';   // 未查 / 非运行 / 无 GPU / 出错：不打扰
+  const s = gpuSummary(g.gpus);
+  const expanded = gpuExpanded.has(t.id);
+  const parts = [];
+  parts.push(s.count + '× ' + esc(s.model));
+  if (s.memPct != null) parts.push('显存 ' + s.memPct + '%');
+  if (s.avgUtil != null) parts.push('利用率 ' + s.avgUtil + '%');
+  return \`<div class="gpu-sum" data-gpu-id="\${t.id}" title="点击\${expanded ? '收起' : '展开'}每块卡明细">
+      <span class="gpu-icon">🎮</span>\${parts.join(' · ')}
+      <span class="gpu-toggle">\${expanded ? '收起' : '展开'}</span>
+    </div>\${expanded ? gpuDetailHtml(g.gpus) : ''}\`;
+}
 
 function render(tunnels) {
   const list = $('list');
@@ -723,6 +885,7 @@ function render(tunnels) {
         <div class="name">\${esc(t.name)} \${badge}\${t.pid?'<span class="sub" style="color:var(--muted);font-size:11px">pid '+t.pid+'</span>':''}</div>
         <div class="url" title="\${esc(t.url)}">\${esc(t.url)}\${t.args?'  ·  '+esc(t.args):''}</div>
         <div class="ssh \${running&&!unreachable?'ready':'off'}" data-cmd="\${esc(ssh)}" title="点击复制 ssh 指令">\${esc(ssh)} <span class="copy">\${unreachable?'已断开':(running?'点击复制':'未运行')}</span></div>
+        \${gpuBlockHtml(t)}
       </div>
       <div class="actions">
         \${running
@@ -783,6 +946,14 @@ $('f-add').addEventListener('click', async () => {
 });
 
 $('list').addEventListener('click', async (ev) => {
+  // 点击 GPU 概览行：展开/收起该隧道的每块卡明细（纯前端态，不发请求）
+  const gpuEl = ev.target.closest('.gpu-sum');
+  if (gpuEl) {
+    const gid = gpuEl.dataset.gpuId;
+    if (gpuExpanded.has(gid)) gpuExpanded.delete(gid); else gpuExpanded.add(gid);
+    render(lastTunnels);
+    return;
+  }
   const sshEl = ev.target.closest('.ssh');
   if (sshEl) {
     try { await navigator.clipboard.writeText(sshEl.dataset.cmd); toast('已复制: ' + sshEl.dataset.cmd); }
@@ -865,6 +1036,10 @@ reconcile(loadTunnels()); // 启动即接管已有进程的真实状态
 // 后台周期性探测「运行中」隧道的远程可达性（检测远程关机/断网）
 runHealthChecks();
 setInterval(runHealthChecks, 15000);
+
+// 后台周期性查询「运行中」隧道节点的 GPU 使用情况（SSH + nvidia-smi）
+runGpuChecks();
+setInterval(runGpuChecks, 15000);
 
 server.listen(WEB_PORT, '127.0.0.1', () => {
   const url = `http://127.0.0.1:${WEB_PORT}`;
