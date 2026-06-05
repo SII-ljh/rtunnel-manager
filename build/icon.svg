@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    rtunnel app 图标：浅色圆角底 + 大号 "RT" + 低饱和蓝色。
+    macOS 应用图标建议保留外边距（约 10%），所以圆角矩形不顶满 1024。
+    单一形状 + 单一文字，避免复杂仪表盘 / 渐变 / 装饰图案。
+  -->
+  <rect x="92" y="92" width="840" height="840" rx="190" ry="190" fill="#eef1fb"/>
+  <rect x="92" y="92" width="840" height="840" rx="190" ry="190" fill="none" stroke="#d6dcf4" stroke-width="4"/>
+  <text x="512" y="660"
+        text-anchor="middle"
+        font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="440"
+        font-weight="700"
+        letter-spacing="-12"
+        fill="#4f6bed">RT</text>
+</svg>

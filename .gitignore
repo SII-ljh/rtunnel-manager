@@ -9,3 +9,12 @@ data/
 # 系统垃圾
 .DS_Store
 .omc/
+
+# Electron 打包产物
+node_modules/
+dist/
+
+# icon 构建中间文件（保留 icon.svg 与 icon.icns）
+build/icon-1024.png
+build/icon.iconset/
+build/_icon-render.html

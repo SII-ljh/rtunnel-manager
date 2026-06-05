@@ -1,0 +1,50 @@
+{
+  "name": "rtunnel-manager",
+  "version": "1.0.0",
+  "description": "rtunnel 管理器 —— 桌面端 SSH 隧道管理面板",
+  "author": "SII-ljh",
+  "license": "MIT",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron .",
+    "serve": "node server.js",
+    "icon": "bash scripts/build-icon.sh",
+    "sign:deps": "bash scripts/sign-deps.sh",
+    "sign:app": "bash scripts/sign-app.sh",
+    "postinstall": "bash scripts/sign-deps.sh",
+    "dist": "npm run icon && electron-builder --mac && npm run sign:app",
+    "dist:dir": "npm run icon && electron-builder --mac dir && npm run sign:app"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "space.baoyu.rtunnel-manager",
+    "productName": "rtunnel",
+    "asar": true,
+    "files": [
+      "electron-main.js",
+      "server.js",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "tunnels.json", "to": "tunnels.json" }
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        { "target": "dir", "arch": ["arm64"] },
+        { "target": "dmg", "arch": ["arm64"] }
+      ],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "dmg": {
+      "title": "rtunnel ${version}",
+      "icon": "build/icon.icns"
+    }
+  }
+}

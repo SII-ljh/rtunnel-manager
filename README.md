@@ -1,17 +1,61 @@
 # rtunnel 管理器
 
-一个极简的 Web 工具，用来运行 / 关闭 / 管理多个 [`rtunnel`](https://github.com/yangxikun/rtunnel) SSH 隧道。
-**单文件、零依赖**（只用 Node.js 内置模块）。把这个目录发给别人，对方装好 `rtunnel` 和 Node.js 就能直接用。
+一个 Linear 风格的 SSH 隧道管理面板，用来运行 / 关闭 / 管理多个
+[`rtunnel`](https://github.com/yangxikun/rtunnel) 隧道。
+
+两种用法，二选一：
+- **桌面 App**（推荐）：双击 `rtunnel.app` 启动，独立窗口、Dock 图标，跟普通 macOS 软件一样。
+- **CLI 模式**：`node server.js`，在浏览器打开 `http://127.0.0.1:7070`。和以前一样。
 
 ## 前提
 
 - 已安装 `rtunnel` 并在 `PATH` 中（`which rtunnel` 能找到）
-- 已安装 Node.js（`node -v`）
+- 已安装 Node.js（`node -v`，CLI 模式和 App 构建期都需要）
 
-## 启动
+## 用法 A：桌面 App（双击启动）
+
+### 一次性构建
 
 ```bash
-# 方式一：后台常驻（推荐，关掉终端也不影响）
+npm install                  # 安装 electron + electron-builder（首次约 30s）
+npm run dist                 # 产出 dist/rtunnel-*.dmg 与 dist/mac-arm64/rtunnel.app
+```
+
+构建产物：
+- `dist/mac-arm64/rtunnel.app` —— 可直接双击运行，也可拖进 `/Applications`。
+- `dist/rtunnel-1.0.0-arm64.dmg` —— 分发用的安装镜像，双击挂载、拖入 Applications。
+
+> 仅构建 .app 不打 DMG：`npm run dist:dir`（更快）
+
+### 日常使用
+
+双击 `rtunnel.app` 即可：
+- 内置一个 HTTP 服务（监听 127.0.0.1:7070），由 Electron 窗口加载。
+- 关闭窗口 → 退出整个 App，端口随之释放。已运行的 `rtunnel` 子进程独立存活，不受影响。
+- 应用图标：高分辨率 `build/icon.icns`（16/32/128/256/512px + @2x），不会被 BrowserWindow 的低分图标覆盖。
+
+> **首次打开提示**：因为这个 .app 是 ad-hoc 签名（没有 Apple Developer ID），
+> macOS Gatekeeper 首次会拦住。在「**系统设置 → 隐私与安全性**」拉到最下面点
+> 「**仍要打开**」一次即可，之后不会再问。
+>
+> 命令行等价：`xattr -dr com.apple.quarantine /Applications/rtunnel.app`
+
+### 配置文件位置（桌面 App 模式）
+
+App 不写自己的 .app 包内（asar 只读）。隧道列表落在用户可写的：
+
+```
+~/Library/Application Support/rtunnel-manager/tunnels.json   # 隧道列表
+~/Library/Application Support/rtunnel-manager/runtime.json   # 运行状态（pid/status）
+~/Library/Application Support/rtunnel-manager/logs/          # 每条隧道的日志
+```
+
+需要跨设备同步可手动 symlink `tunnels.json` 到 iCloud / Dropbox 目录。
+
+## 用法 B：CLI 模式（保留原行为）
+
+```bash
+# 方式一：后台常驻（关掉终端也不影响）
 ./start.sh
 
 # 方式二：前台运行
@@ -22,6 +66,7 @@ RT_MANAGER_PORT=8090 ./start.sh
 ```
 
 启动后浏览器打开 **http://127.0.0.1:7070**（macOS 会自动打开）。
+CLI 模式下 `tunnels.json` 仍写在脚本同目录（用于 iCloud/Dropbox 同步）。
 
 ## 使用
 
@@ -114,8 +159,16 @@ pkill -f "node server.js"     # 不影响已脱离的 rtunnel 隧道
 
 ```
 rtunnel-manager/
-├── server.js       # 主程序：HTTP server + 前端页面 + 子进程管理
-├── start.sh        # 后台启动脚本（nohup + disown）
-├── tunnels.json    # 隧道列表（首次启动后生成；跨设备同步）
+├── server.js              # 主程序：HTTP server + 前端页面 + 子进程管理（CLI / Electron 共用）
+├── electron-main.js       # Electron 主进程：拉起 server.js + BrowserWindow
+├── package.json           # npm + electron-builder 构建配置
+├── start.sh               # CLI 模式：后台启动脚本（nohup + disown）
+├── build/
+│   ├── icon.svg           # App 图标源（RT + 浅色圆角底 + 低饱和蓝）
+│   ├── icon.icns          # 编译好的 macOS 应用图标（含 16~1024 全套尺寸）
+│   └── icon-1024.png      # 中间产物（用于 sips 缩放）
+├── scripts/
+│   └── build-icon.sh      # SVG → 1024 PNG → iconset → icns 的脚本
+├── tunnels.json           # 隧道列表（CLI 模式落在此处）
 └── README.md
 ```

@@ -29,7 +29,10 @@ const { spawn, execFile } = require('child_process');
 //   - RUNTIME_FILE:  本机 Library 下，按 id 存 { pid, status, startedAt }。
 //     pid 是机器本地编号，绝不能跨设备共享，否则 reconcile() 会把对方机器
 //     还活着的隧道误判为 stopped 并写回，下次启动就撞 EADDRINUSE。
-const SHARED_CONFIG = path.join(__dirname, 'tunnels.json');
+// 打包成 Electron .app 后 __dirname 落在只读的 asar 里，不能在那写配置。
+// 允许通过 RT_SHARED_CONFIG 显式指定一个可写位置（Electron 主进程会设置它），
+// CLI 模式下保持原行为：与 server.js 同目录（这样跟着 iCloud / Dropbox 同步走）。
+const SHARED_CONFIG = process.env.RT_SHARED_CONFIG || path.join(__dirname, 'tunnels.json');
 const DATA_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'rtunnel-manager');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const RUNTIME_FILE = path.join(DATA_DIR, 'runtime.json');
@@ -655,145 +658,622 @@ const server = http.createServer(async (req, res) => {
 
 // ---------- 前端页面 ----------
 const HTML_PAGE = `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="author" content="SII-ljh">
 <meta name="generator" content="rtunnel-manager · ljh">
 <title>rtunnel 管理器</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23eef1fb'/><text x='32' y='43' text-anchor='middle' font-family='-apple-system,Segoe UI,sans-serif' font-size='26' font-weight='700' fill='%234f6bed'>RT</text></svg>">
 <!-- crafted by SII-ljh · https://github.com/SII-ljh -->
 <style>
-  :root {
-    --bg: #f7f8fa; --card: #ffffff; --line: #e8eaed; --text: #1f2329;
-    --muted: #8a8f99; --accent: #2563eb; --accent-soft: #eff4ff;
-    --green: #16a34a; --green-soft: #e9f7ee; --red: #dc2626; --red-soft: #fdeded;
-    --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
+  /* ---------- 主题变量：浅色（默认）+ 深色 ---------- */
+  :root[data-theme='light'] {
+    --bg: #fafbfc;
+    --surface: #ffffff;
+    --surface-2: #f4f5f8;
+    --surface-3: #eceef2;
+    --border: #e5e6ec;
+    --border-strong: #d2d5dd;
+    --text: #1a1d24;
+    --text-muted: #686d78;
+    --text-subtle: #9499a3;
+    --accent: #4f6bed;
+    --accent-hover: #3f59d4;
+    --accent-soft: #eef1fc;
+    --accent-border: #cfd7f5;
+    --accent-text: #ffffff;
+    --success: #1f9d55;
+    --success-soft: #e6f4ec;
+    --warning: #b8770e;
+    --warning-soft: #f9efe0;
+    --danger: #c0392b;
+    --danger-soft: #fae9e7;
+    --overlay: rgba(15,18,28,.42);
+    --focus-ring: rgba(79,107,237,.25);
   }
-  * { box-sizing: border-box; }
+  :root[data-theme='dark'] {
+    --bg: #0d0f14;
+    --surface: #14171f;
+    --surface-2: #1b1f2a;
+    --surface-3: #232838;
+    --border: #262a36;
+    --border-strong: #353a4a;
+    --text: #e6e8ee;
+    --text-muted: #8a8f9c;
+    --text-subtle: #62677a;
+    --accent: #6b85f2;
+    --accent-hover: #8198f5;
+    --accent-soft: #1d2238;
+    --accent-border: #2a3354;
+    --accent-text: #ffffff;
+    --success: #4ac38a;
+    --success-soft: #14241c;
+    --warning: #d99550;
+    --warning-soft: #2a2117;
+    --danger: #e26565;
+    --danger-soft: #2a181a;
+    --overlay: rgba(0,0,0,.6);
+    --focus-ring: rgba(107,133,242,.35);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
   }
-  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; }
-  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
-  header h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: .2px; }
-  header .sub { color: var(--muted); font-size: 13px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
-  .add { padding: 18px; margin-bottom: 22px; }
-  .add h2 { font-size: 14px; margin: 0 0 14px; color: var(--muted); font-weight: 600; }
-  .grid { display: grid; grid-template-columns: 1.1fr 4.4fr 0.9fr 0.8fr 1fr auto; gap: 10px; align-items: end; }
-  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
-  input[type=text], input[type=number] {
-    width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
-    font-size: 13px; background: #fcfcfd; color: var(--text); outline: none; transition: border-color .15s, box-shadow .15s;
+
+  /* ---------- 顶部状态栏 ---------- */
+  .topbar {
+    height: 52px;
+    padding: 0 20px;
+    display: flex; align-items: center; gap: 18px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 20;
   }
-  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); background: #fff; }
-  button { font: inherit; cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px; font-size: 13px; font-weight: 500; transition: background .15s, opacity .15s; }
-  button:disabled { opacity: .5; cursor: default; }
-  .btn-primary { background: var(--accent); color: #fff; }
-  .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
-  .btn-ghost { background: transparent; border: 1px solid var(--line); color: var(--text); padding: 6px 12px; }
-  .btn-ghost:hover { background: #f3f4f6; }
-  .btn-start { background: var(--green-soft); color: var(--green); padding: 6px 12px; }
-  .btn-start:hover { background: #d9f0e1; }
-  .btn-stop { background: #fff3e6; color: #d97706; padding: 6px 12px; }
-  .btn-stop:hover { background: #ffe9cf; }
-  .btn-del { background: transparent; color: var(--muted); padding: 6px 10px; }
-  .btn-del:hover { background: var(--red-soft); color: var(--red); }
-  .btn-edit { background: transparent; border: 1px solid var(--line); color: var(--text); padding: 6px 12px; }
-  .btn-edit:hover { background: #f3f4f6; }
-  .btn-quit { margin-left: auto; background: transparent; border: 1px solid var(--line); color: var(--muted); padding: 7px 14px; align-self: center; }
-  .btn-quit:hover { background: var(--red-soft); border-color: #f3c0c0; color: var(--red); }
-  .row.editing { background: #fbfcfe; }
-  .edit-grid { display: grid; grid-template-columns: 1.1fr 4.4fr 0.9fr 0.8fr 1fr; gap: 10px; align-items: end; }
-  @media (max-width: 720px) { .edit-grid { grid-template-columns: 1fr; } }
-  .list { padding: 6px; }
-  .row { display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: center; padding: 14px 14px; border-bottom: 1px solid var(--line); }
-  .row:last-child { border-bottom: none; }
-  .row .info { min-width: 0; }
-  .row .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .row .url { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; }
-  .badge.running { background: var(--green-soft); color: var(--green); }
-  .badge.stopped { background: #f1f2f4; color: var(--muted); }
-  .badge.unreachable { background: var(--red-soft); color: var(--red); cursor: help; }
-  .ssh { margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: #334155; background: #f6f7f9; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; display: inline-flex; align-items: center; gap: 10px; cursor: pointer; transition: background .15s, border-color .15s; }
-  .ssh:hover { background: #eef1f5; }
-  .ssh .copy { font-size: 11px; font-weight: 600; }
-  /* 运行中的隧道：ssh 指令醒目可复制 */
-  .ssh.ready { background: var(--accent-soft); border-color: #c7dafe; color: #1e40af; }
-  .ssh.ready:hover { background: #e3edff; }
-  .ssh.ready .copy { color: var(--accent); }
-  .ssh.off { opacity: .65; }
-  .ssh.off .copy { color: var(--muted); }
-  /* GPU 行内概览 */
-  .gpu-sum { margin-top: 8px; display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: #3730a3; background: #f1f0fe; border: 1px solid #e0ddfb; border-radius: 7px; padding: 5px 10px; cursor: pointer; transition: background .15s; }
-  .gpu-sum:hover { background: #e8e6fd; }
-  .gpu-sum .gpu-icon { font-size: 12px; }
-  .gpu-sum .gpu-toggle { color: var(--muted); font-size: 11px; font-weight: 600; margin-left: 2px; }
-  .gpu-err { margin-top: 8px; font-size: 12px; color: var(--muted); }
-  /* GPU 明细表 */
-  .gpu-table { margin-top: 8px; border-collapse: collapse; font-size: 12px; width: 100%; max-width: 560px; }
-  .gpu-table th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
-  .gpu-table td { padding: 5px 10px 5px 0; border-bottom: 1px solid #f1f2f4; vertical-align: middle; white-space: nowrap; }
-  .gpu-table tr:last-child td { border-bottom: none; }
-  .gpu-meter { display: inline-block; vertical-align: middle; width: 56px; height: 6px; border-radius: 4px; background: #ececf5; margin-left: 7px; overflow: hidden; }
-  .gpu-meter > i { display: block; height: 100%; background: var(--accent); }
-  .gpu-meter.hot > i { background: var(--red); }
-  .actions { display: flex; gap: 6px; align-items: center; }
-  .empty { text-align: center; color: var(--muted); padding: 40px 0; }
-  #toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); max-width: 80%; background: #1f2329; color: #fff; padding: 11px 16px; border-radius: 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.18); opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s; white-space: pre-wrap; }
-  #toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
-  #toast.err { background: #b91c1c; }
-  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .signoff { text-align: center; margin-top: 36px; font-size: 11px; color: var(--muted); letter-spacing: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .42; user-select: none; transition: opacity .25s; }
-  .signoff:hover { opacity: .85; }
+  /* Electron 桌面端：顶栏整条作为窗口拖动区，并给左侧预留出红黄绿按钮的位置；
+     里头的可点元素显式还原为 no-drag。浏览器模式下不挂这两条规则。 */
+  body[data-app="desktop"] .topbar { -webkit-app-region: drag; app-region: drag; padding-left: 84px; }
+  body[data-app="desktop"] .topbar button,
+  body[data-app="desktop"] .topbar input,
+  body[data-app="desktop"] .topbar .ssh-chip { -webkit-app-region: no-drag; app-region: no-drag; }
+  /* 全屏时 macOS 收起红黄绿，padding 还原成正常 */
+  body[data-app="desktop"]:fullscreen .topbar { padding-left: 20px; }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand .logo {
+    width: 28px; height: 28px; border-radius: 7px;
+    background: var(--accent-soft); color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px; letter-spacing: -0.4px;
+    flex-shrink: 0;
+  }
+  .brand h1 {
+    font-size: 13.5px; font-weight: 600; margin: 0;
+    letter-spacing: -0.1px; color: var(--text); white-space: nowrap;
+  }
+  .topbar-stats { display: flex; gap: 14px; font-size: 12px; }
+  .topbar-stats .stat {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--text-muted);
+  }
+  .topbar-stats .stat .dot {
+    width: 6px; height: 6px; border-radius: 999px; background: var(--text-subtle);
+  }
+  .topbar-stats .stat.running .dot { background: var(--success); }
+  .topbar-stats .stat.unreachable .dot { background: var(--danger); }
+  .topbar-stats .stat b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .topbar-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+
+  /* ---------- 按钮（全部自定义；明确 hover / active / focus / disabled） ---------- */
+  .btn {
+    -webkit-appearance: none; appearance: none;
+    font: inherit;
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    font-weight: 500;
+    line-height: 1.35;
+    white-space: nowrap;
+    color: var(--text);
+    background: var(--surface);
+    transition: background .12s ease, border-color .12s ease, color .12s ease;
+    user-select: none;
+  }
+  .btn:focus { outline: none; }
+  .btn:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--accent); color: var(--accent-text);
+    border-color: var(--accent);
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-primary:active:not(:disabled) { background: var(--accent-hover); }
+  .btn-ghost {
+    background: var(--surface);
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .btn-ghost:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
+  .btn-ghost:active:not(:disabled) { background: var(--surface-3); }
+  .btn-subtle {
+    background: transparent;
+    color: var(--text-muted);
+    border-color: transparent;
+    padding: 6px 9px;
+  }
+  .btn-subtle:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+  .btn-subtle:active:not(:disabled) { background: var(--surface-3); }
+  .btn-danger {
+    background: transparent; color: var(--text-muted);
+    border-color: transparent; padding: 6px 9px;
+  }
+  .btn-danger:hover:not(:disabled) { background: var(--danger-soft); color: var(--danger); }
+  .btn-icon {
+    width: 30px; height: 30px; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--text-muted); border-color: transparent;
+  }
+  .btn-icon:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+  .btn-icon svg { width: 14px; height: 14px; }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+  /* ---------- 容器 ---------- */
+  .container { max-width: 1280px; margin: 0 auto; padding: 24px 20px 60px; }
+
+  /* ---------- 关键指标卡 ---------- */
+  .metrics {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    margin-bottom: 28px;
+  }
+  .metric {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 4px;
+    min-width: 0;
+  }
+  .metric .label {
+    font-size: 11px; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500;
+  }
+  .metric .value {
+    font-size: 22px; font-weight: 600; color: var(--text);
+    font-variant-numeric: tabular-nums; line-height: 1.2;
+  }
+  .metric .value .unit { font-size: 13px; color: var(--text-muted); font-weight: 500; margin-left: 3px; }
+  .metric .value.warn { color: var(--danger); }
+  .metric .value.muted { color: var(--text-muted); }
+  .metric .sub { font-size: 11px; color: var(--text-subtle); }
+
+  /* ---------- 分组 ---------- */
+  .group { margin-bottom: 24px; }
+  .group:last-child { margin-bottom: 0; }
+  .group-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 4px 10px;
+  }
+  .group-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--text-subtle); }
+  .group[data-status='running'] .group-dot { background: var(--success); }
+  .group[data-status='unreachable'] .group-dot { background: var(--danger); }
+  .group[data-status='stopped'] .group-dot { background: var(--text-subtle); }
+  .group-title {
+    font-size: 12px; font-weight: 600; color: var(--text);
+    letter-spacing: 0.3px;
+  }
+  .group-count {
+    font-size: 11px; color: var(--text-muted);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    padding: 1px 8px; border-radius: 999px;
+    font-weight: 500; font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- 数据表 ---------- */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .table-scroll { overflow-x: auto; }
+  table.data {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+    min-width: 760px;
+  }
+  table.data th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 8px 14px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    height: 34px;
+  }
+  table.data td {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    height: 38px;
+    color: var(--text);
+  }
+  table.data tbody tr:last-child > td { border-bottom: none; }
+  table.data tbody tr.data-row:hover { background: var(--surface-2); }
+  table.data tbody tr.detail-row > td {
+    background: var(--surface-2);
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.data .col-chevron { width: 24px; padding-left: 14px; padding-right: 0; }
+  table.data .col-name { font-weight: 600; color: var(--text); white-space: nowrap; min-width: 140px; }
+  table.data .col-url { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; max-width: 220px; width: 220px; }
+  table.data .col-url .url-text { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  table.data .col-ssh { white-space: nowrap; }
+  table.data .col-gpu { min-width: 180px; }
+  table.data .col-pid { color: var(--text-subtle); font-variant-numeric: tabular-nums; font-size: 12px; width: 60px; }
+  table.data .col-actions { text-align: right; white-space: nowrap; width: 1%; }
+  table.data .col-actions .btn { margin-left: 3px; }
+
+  /* 状态徽标 */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500;
+    padding: 1px 8px; border-radius: 999px;
+    background: var(--surface-2); color: var(--text-muted);
+    border: 1px solid var(--border);
+    line-height: 1.5;
+  }
+  .pill.running { background: var(--success-soft); color: var(--success); border-color: transparent; }
+  .pill.unreachable { background: var(--danger-soft); color: var(--danger); border-color: transparent; cursor: help; }
+  .pill.stopped { background: var(--surface-2); color: var(--text-muted); }
+
+  .name-cell { display: inline-flex; align-items: center; gap: 8px; }
+
+  /* 展开 chevron */
+  .chev {
+    width: 18px; height: 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 4px;
+    background: transparent; color: var(--text-muted);
+    border: none; cursor: pointer; padding: 0;
+    transition: background .12s, transform .12s, color .12s;
+  }
+  .chev:hover { background: var(--surface-3); color: var(--text); }
+  .chev svg { width: 12px; height: 12px; transition: transform .15s; }
+  .chev.open svg { transform: rotate(90deg); }
+
+  /* SSH 复制 chip */
+  .ssh-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 2px 8px;
+    color: var(--text);
+    cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
+    line-height: 1.5;
+  }
+  .ssh-chip:hover { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+  .ssh-chip.ready { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+  .ssh-chip.disabled { opacity: 0.5; cursor: not-allowed; }
+  .ssh-chip.disabled:hover { background: var(--surface-2); border-color: var(--border); color: var(--text-muted); }
+  .ssh-chip .copy-hint { font-size: 10.5px; color: var(--text-subtle); font-family: inherit; }
+  .ssh-chip:hover .copy-hint, .ssh-chip.ready .copy-hint { color: inherit; opacity: 0.75; }
+
+  /* GPU 概要 */
+  .gpu-info { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; }
+  .gpu-info .gpu-model { color: var(--text); font-weight: 500; }
+  .gpu-info .metric-inline { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+  .gpu-info .metric-inline b { color: var(--text); font-weight: 500; }
+  .gpu-info-dim { color: var(--text-subtle); font-size: 12px; }
+
+  .bar { width: 36px; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; flex-shrink: 0; }
+  .bar > i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .bar.warn > i { background: var(--warning); }
+  .bar.hot > i { background: var(--danger); }
+
+  /* 展开后的 GPU 明细 */
+  .detail-panel { display: flex; flex-direction: column; gap: 12px; }
+  .detail-meta {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    font-size: 12px; color: var(--text-muted);
+  }
+  .detail-meta b { color: var(--text); font-weight: 500; }
+  table.gpu-detail {
+    border-collapse: collapse;
+    font-size: 12px;
+    color: var(--text);
+    width: auto;
+  }
+  table.gpu-detail th, table.gpu-detail td {
+    text-align: left;
+    padding: 5px 18px 5px 0;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    height: auto;
+  }
+  table.gpu-detail th {
+    color: var(--text-muted); font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.4px;
+    background: transparent;
+  }
+  table.gpu-detail tr:last-child td { border-bottom: none; }
+  table.gpu-detail td .metric-inline { display: inline-flex; align-items: center; gap: 6px; }
+
+  .detail-error {
+    font-size: 12px; color: var(--text-muted);
+    background: var(--surface); border: 1px dashed var(--border);
+    padding: 8px 12px; border-radius: 6px;
+  }
+
+  /* 空态 */
+  .empty {
+    padding: 48px 20px; text-align: center;
+    color: var(--text-muted);
+    background: var(--surface);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+  }
+  .empty .title { font-size: 14px; color: var(--text); font-weight: 500; margin-bottom: 6px; }
+
+  /* ---------- 模态框 ---------- */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: var(--overlay);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100; padding: 20px;
+    animation: fadeIn .15s ease-out;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 100%; max-width: 540px; max-height: 90vh;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 12px 40px rgba(0,0,0,.18);
+  }
+  .modal-large { max-width: 760px; }
+  .modal-header {
+    display: flex; align-items: center;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-header h2 { font-size: 14px; margin: 0; font-weight: 600; color: var(--text); }
+  .modal-header .btn-icon { margin-left: auto; }
+  .modal-body { padding: 18px; overflow: auto; }
+  .modal-footer {
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    display: flex; justify-content: flex-end; gap: 8px;
+    background: var(--surface);
+  }
+
+  .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { font-size: 11.5px; font-weight: 500; color: var(--text-muted); }
+  .field .hint { font-size: 11px; color: var(--text-subtle); }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .form-grid .field { margin-bottom: 0; }
+
+  input[type="text"], input[type="number"] {
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+    transition: border-color .12s, box-shadow .12s;
+    width: 100%;
+  }
+  input[type="text"]:focus, input[type="number"]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  input[type="text"]::placeholder, input[type="number"]::placeholder { color: var(--text-subtle); }
+
+  pre.log-view {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    max-height: 60vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  /* ---------- toast ---------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 24px;
+    transform: translateX(-50%) translateY(8px);
+    background: var(--text); color: var(--bg);
+    padding: 9px 16px; border-radius: 8px;
+    font-size: 12.5px; opacity: 0; pointer-events: none;
+    transition: opacity .18s, transform .18s;
+    z-index: 200; max-width: 80%;
+    white-space: pre-wrap;
+    box-shadow: 0 8px 24px rgba(0,0,0,.18);
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.err { background: var(--danger); color: #fff; }
+
+  .signoff {
+    text-align: center; margin-top: 32px;
+    font-size: 11px; color: var(--text-subtle);
+    letter-spacing: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    opacity: .4; transition: opacity .25s;
+  }
+  .signoff:hover { opacity: .8; }
   .signoff a { color: inherit; text-decoration: none; }
-  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } .row { grid-template-columns: 1fr; } .actions { justify-content: flex-start; } }
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width: 960px) {
+    .metrics { grid-template-columns: repeat(2, 1fr); }
+    .topbar-stats { display: none; }
+  }
+  @media (max-width: 720px) {
+    .container { padding: 16px 12px 40px; }
+    .topbar { padding: 0 12px; gap: 10px; }
+    .form-grid { grid-template-columns: 1fr; }
+    table.data .col-url { display: none; }
+  }
+  @media (max-width: 560px) {
+    .metrics { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .metric { padding: 12px 14px; }
+    .metric .value { font-size: 18px; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>rtunnel 管理器</h1>
-    <span class="sub">运行 / 关闭 / 管理你的 SSH 隧道</span>
-    <button class="btn-quit" id="quit" title="关闭管理器（已运行的隧道不受影响）">退出管理器</button>
-  </header>
-
-  <div class="card add">
-    <h2>新建隧道</h2>
-    <div class="grid">
-      <div class="field"><label>名称（可选）</label><input id="f-name" type="text" placeholder="my-server"></div>
-      <div class="field"><label>远程 URL</label><input id="f-url" type="text" placeholder="https://...sii.edu.cn/.../proxy/47230/"></div>
-      <div class="field"><label>用户名</label><input id="f-user" type="text" placeholder="root" value="root"></div>
-      <div class="field"><label>本地端口</label><input id="f-port" type="number" placeholder="4444" min="1" max="65535"></div>
-      <div class="field"><label>额外参数（可选）</label><input id="f-args" type="text" placeholder="--secure"></div>
-      <div class="field"><button class="btn-primary" id="f-add">添加</button></div>
-    </div>
-    <div class="hint">rtunnel 始终以直连方式运行（自动剔除代理变量，不影响你 shell 的代理）；启动前会直连探测目标 URL，连得上才放行。</div>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">RT</div>
+    <h1>rtunnel</h1>
   </div>
+  <div class="topbar-stats" id="topbar-stats"></div>
+  <div class="topbar-actions">
+    <button class="btn btn-primary btn-sm" id="open-new">+ 新建隧道</button>
+    <button class="btn btn-icon" id="theme-toggle" title="切换主题" aria-label="切换主题"></button>
+    <button class="btn btn-ghost btn-sm" id="quit" title="关闭管理器（已运行的隧道不受影响）">退出</button>
+  </div>
+</header>
 
-  <div class="card list" id="list"></div>
-
+<main class="container">
+  <section class="metrics" id="metrics"></section>
+  <section id="groups"></section>
   <footer class="signoff" title="rtunnel 管理器 · by SII-ljh"><a href="https://github.com/SII-ljh" target="_blank" rel="noopener">· ljh ·</a></footer>
+</main>
+
+<!-- 模态：新建 / 编辑 -->
+<div class="modal-backdrop" id="modal-form" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-form-title">
+    <header class="modal-header">
+      <h2 id="modal-form-title">新建隧道</h2>
+      <button class="btn btn-icon" data-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <div class="field">
+        <label for="m-name">名称（可选）</label>
+        <input id="m-name" type="text" placeholder="my-server">
+      </div>
+      <div class="field">
+        <label for="m-url">远程 URL</label>
+        <input id="m-url" type="text" placeholder="https://...sii.edu.cn/.../proxy/47230/">
+      </div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="m-user">用户名</label>
+          <input id="m-user" type="text" placeholder="root" value="root">
+        </div>
+        <div class="field">
+          <label for="m-port">本地端口</label>
+          <input id="m-port" type="number" placeholder="4444" min="1" max="65535">
+        </div>
+      </div>
+      <div class="field">
+        <label for="m-args">额外参数（可选）</label>
+        <input id="m-args" type="text" placeholder="--secure">
+        <div class="hint">启动前会先直连探测目标 URL；rtunnel 子进程将剔除代理变量直连运行。</div>
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost btn-sm" data-close>取消</button>
+      <button class="btn btn-primary btn-sm" id="m-submit">添加</button>
+      <button class="btn btn-primary btn-sm" id="m-submit-restart" hidden>保存并重启</button>
+    </footer>
+  </div>
 </div>
+
+<!-- 模态：日志 -->
+<div class="modal-backdrop" id="modal-log" hidden>
+  <div class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="modal-log-title">
+    <header class="modal-header">
+      <h2 id="modal-log-title">日志</h2>
+      <button class="btn btn-icon" data-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <pre class="log-view" id="log-content">(加载中…)</pre>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost btn-sm" data-close>关闭</button>
+    </footer>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
+'use strict';
+
+// ---------- 主题 ----------
+const THEME_KEY = 'rt-theme';
+const SVG_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const SVG_SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>';
+const SVG_CHEV = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>';
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem(THEME_KEY, theme); } catch (_) {}
+  const btn = document.getElementById('theme-toggle');
+  if (btn) {
+    btn.innerHTML = theme === 'dark' ? SVG_SUN : SVG_MOON;
+    btn.title = theme === 'dark' ? '切换到浅色' : '切换到深色';
+  }
+}
+function initTheme() {
+  let theme;
+  try { theme = localStorage.getItem(THEME_KEY); } catch (_) {}
+  if (!theme) theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  setTheme(theme);
+}
+
+// Electron 装在 UA 里能识别（包含 "Electron"）。装上 data-app 让 CSS 给顶栏开
+// drag region + 左侧 padding；浏览器模式下不挂这些规则，避免无意义的留白。
+function initAppMode() {
+  if (/Electron\\//i.test(navigator.userAgent)) {
+    document.body.setAttribute('data-app', 'desktop');
+  }
+}
+
+// ---------- 工具 ----------
+const $ = (sel, root) => (root || document).querySelector(sel);
 let toastTimer = null;
-let editingId = null;        // 正在编辑的隧道 id（编辑期间暂停自动刷新覆盖）
-let lastTunnels = [];        // 最近一次的隧道数据（取消编辑时用来重绘）
-const gpuExpanded = new Set(); // 已展开 GPU 明细的隧道 id（前端态，定时刷新不丢）
 function toast(msg, isErr) {
-  const el = $('toast');
+  const el = $('#toast');
   el.textContent = msg;
   el.className = 'show' + (isErr ? ' err' : '');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.className = ''; }, isErr ? 6000 : 2500);
 }
-
 async function api(url, opts) {
   const res = await fetch(url, opts);
   let data = {};
@@ -801,227 +1281,435 @@ async function api(url, opts) {
   if (!res.ok) throw new Error(data.error || ('请求失败 ' + res.status));
   return data;
 }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// ---------- 状态 ----------
+const state = {
+  tunnels: [],
+  expanded: new Set(),  // 展开 GPU 明细的 id
+};
+let modalMode = null;    // null | 'create' | { mode: 'edit', id }
 
-// 去掉型号里冗长的前缀/后缀，留个好认的短名：
-// "NVIDIA A100-SXM4-40GB" -> "A100-SXM4-40GB"，"Tesla V100" -> "Tesla V100"
-function gpuShortName(name) { return String(name || '').replace(/^NVIDIA\\s+/i, '').trim() || 'GPU'; }
-
-// 从一组卡算出行内汇总：卡数、统一型号（不统一则记 GPU）、总显存占用率、平均利用率。
+// ---------- 数据加工：过滤 / 分组 / 排序 ----------
+// 过滤无关 GPU：memTotal=0 / null（CPU-only 或 nvidia-smi 返回异常）
+function validGpus(gpus) {
+  return (gpus || []).filter((x) => x && x.memTotal != null && x.memTotal > 0);
+}
+function gpuShortName(name) {
+  return String(name || '').replace(/^NVIDIA\\s+/i, '').trim() || 'GPU';
+}
 function gpuSummary(gpus) {
-  const count = gpus.length;
-  const names = gpus.map((x) => gpuShortName(x.name));
+  const valid = validGpus(gpus);
+  if (!valid.length) return null;
+  const names = valid.map((x) => gpuShortName(x.name));
   const model = names.every((n) => n === names[0]) ? names[0] : 'GPU';
-  const memUsed = gpus.reduce((s, x) => s + (x.memUsed || 0), 0);
-  const memTotal = gpus.reduce((s, x) => s + (x.memTotal || 0), 0);
+  const memUsed = valid.reduce((s, x) => s + (x.memUsed || 0), 0);
+  const memTotal = valid.reduce((s, x) => s + (x.memTotal || 0), 0);
   const memPct = memTotal ? Math.round((memUsed / memTotal) * 100) : null;
-  const utils = gpus.map((x) => x.util).filter((v) => v != null);
+  const utils = valid.map((x) => x.util).filter((v) => v != null);
   const avgUtil = utils.length ? Math.round(utils.reduce((a, b) => a + b, 0) / utils.length) : null;
-  return { count, model, memPct, avgUtil };
+  return { count: valid.length, model, memUsed, memTotal, memPct, avgUtil, valid };
+}
+function groupTunnels(tunnels) {
+  const g = { unreachable: [], running: [], stopped: [] };
+  for (const t of tunnels) {
+    if (t.status === 'running' && t.reachable === false) g.unreachable.push(t);
+    else if (t.status === 'running') g.running.push(t);
+    else g.stopped.push(t);
+  }
+  // 运行中：按 GPU 平均利用率倒序、然后显存占用倒序
+  g.running.sort((a, b) => {
+    const sa = gpuSummary(a.gpu && a.gpu.gpus) || {};
+    const sb = gpuSummary(b.gpu && b.gpu.gpus) || {};
+    const ua = sa.avgUtil == null ? -1 : sa.avgUtil;
+    const ub = sb.avgUtil == null ? -1 : sb.avgUtil;
+    if (ub !== ua) return ub - ua;
+    const ma = sa.memPct == null ? -1 : sa.memPct;
+    const mb = sb.memPct == null ? -1 : sb.memPct;
+    if (mb !== ma) return mb - ma;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  g.unreachable.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  g.stopped.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  return [
+    { key: 'unreachable', label: '已断开', items: g.unreachable },
+    { key: 'running',     label: '运行中', items: g.running },
+    { key: 'stopped',     label: '已停止', items: g.stopped },
+  ].filter((grp) => grp.items.length > 0);
+}
+function computeMetrics(tunnels) {
+  const total = tunnels.length;
+  const running = tunnels.filter((t) => t.status === 'running' && t.reachable !== false).length;
+  const unreachable = tunnels.filter((t) => t.status === 'running' && t.reachable === false).length;
+  const stopped = tunnels.filter((t) => t.status !== 'running').length;
+  let utils = [], memUsed = 0, memTotal = 0;
+  for (const t of tunnels) {
+    if (t.status !== 'running' || !t.gpu) continue;
+    for (const g of validGpus(t.gpu.gpus)) {
+      if (g.util != null) utils.push(g.util);
+      memUsed += g.memUsed || 0;
+      memTotal += g.memTotal || 0;
+    }
+  }
+  const gpuAvg = utils.length ? Math.round(utils.reduce((a, b) => a + b, 0) / utils.length) : null;
+  const gpuMem = memTotal ? Math.round(memUsed / memTotal * 100) : null;
+  return { total, running, unreachable, stopped, gpuAvg, gpuMem, gpuCardCount: utils.length };
 }
 
-// 一个 0-100 的小进度条；>=85% 标红。
-function meter(pct, hot) {
+// ---------- 渲染 ----------
+function renderTopbarStats(m) {
+  const wrap = $('#topbar-stats');
+  const parts = [
+    \`<span class="stat"><span class="dot"></span><b>\${m.total}</b>隧道</span>\`,
+    \`<span class="stat running"><span class="dot"></span><b>\${m.running}</b>运行</span>\`,
+  ];
+  if (m.unreachable > 0) parts.push(\`<span class="stat unreachable"><span class="dot"></span><b>\${m.unreachable}</b>已断开</span>\`);
+  wrap.innerHTML = parts.join('');
+}
+function renderMetrics(m) {
+  const cards = [
+    { label: '隧道总数', value: m.total, cls: '' },
+    { label: '运行中',   value: m.running, cls: m.running > 0 ? '' : 'muted' },
+    { label: '已断开',   value: m.unreachable, cls: m.unreachable > 0 ? 'warn' : 'muted' },
+  ];
+  // GPU 利用率均值——仅当存在有效 GPU 时展示
+  if (m.gpuCardCount > 0) {
+    cards.push({
+      label: 'GPU 平均利用率',
+      value: m.gpuAvg + '<span class="unit">%</span>',
+      cls: '',
+      sub: m.gpuCardCount + ' 张卡 · 显存 ' + (m.gpuMem == null ? '—' : m.gpuMem + '%'),
+    });
+  } else {
+    cards.push({ label: '已停止', value: m.stopped, cls: m.stopped > 0 ? '' : 'muted' });
+  }
+  $('#metrics').innerHTML = cards.map((c) => \`
+    <div class="metric">
+      <span class="label">\${esc(c.label)}</span>
+      <span class="value \${c.cls}">\${c.value}</span>
+      \${c.sub ? \`<span class="sub">\${esc(c.sub)}</span>\` : ''}
+    </div>
+  \`).join('');
+}
+
+function meterHtml(pct, hot) {
   if (pct == null) return '';
   const w = Math.max(0, Math.min(100, pct));
-  return '<span class="gpu-meter'+(hot && w >= 85 ? ' hot' : '')+'"><i style="width:'+w+'%"></i></span>';
+  let cls = '';
+  if (hot && w >= 85) cls = ' hot';
+  else if (hot && w >= 65) cls = ' warn';
+  return \`<span class="bar\${cls}"><i style="width:\${w}%"></i></span>\`;
 }
 
-// 单块卡的明细表。
-function gpuDetailHtml(gpus) {
-  const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
-  const rows = gpus.map((x) => {
-    const memPct = (x.memUsed != null && x.memTotal) ? Math.round((x.memUsed / x.memTotal) * 100) : null;
-    return \`<tr>
-      <td>\${x.index == null ? '—' : x.index}</td>
-      <td>\${esc(gpuShortName(x.name))}</td>
-      <td>\${x.util == null ? '—' : x.util + '%'}\${meter(x.util, false)}</td>
-      <td>\${gb(x.memUsed)}/\${gb(x.memTotal)} GB\${meter(memPct, true)}</td>
-      <td>\${x.temp == null ? '—' : x.temp + '℃'}</td>
-      <td>\${x.power == null ? '—' : Math.round(x.power) + 'W'}</td>
-    </tr>\`;
-  }).join('');
-  return \`<table class="gpu-table">
-    <thead><tr><th>#</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr></thead>
-    <tbody>\${rows}</tbody>
-  </table>\`;
-}
-
-// 隧道行里的 GPU 区块：运行中且查到卡 → 概览行（可点开明细）；查询出错则静默不显示。
-function gpuBlockHtml(t) {
+function gpuCellHtml(t) {
   const g = t.gpu;
-  if (!g || !g.gpus || !g.gpus.length) return '';   // 未查 / 非运行 / 无 GPU / 出错：不打扰
+  if (!g) return '<span class="gpu-info-dim">—</span>';
   const s = gpuSummary(g.gpus);
-  const expanded = gpuExpanded.has(t.id);
+  if (!s) {
+    if (g.error) return '<span class="gpu-info-dim" title="' + esc(g.error) + '">无 GPU 数据</span>';
+    return '<span class="gpu-info-dim">—</span>';
+  }
   const parts = [];
-  parts.push(s.count + '× ' + esc(s.model));
-  if (s.memPct != null) parts.push('显存 ' + s.memPct + '%');
-  if (s.avgUtil != null) parts.push('利用率 ' + s.avgUtil + '%');
-  return \`<div class="gpu-sum" data-gpu-id="\${t.id}" title="点击\${expanded ? '收起' : '展开'}每块卡明细">
-      <span class="gpu-icon">🎮</span>\${parts.join(' · ')}
-      <span class="gpu-toggle">\${expanded ? '收起' : '展开'}</span>
-    </div>\${expanded ? gpuDetailHtml(g.gpus) : ''}\`;
+  parts.push(\`<span class="gpu-model">\${s.count}× \${esc(s.model)}</span>\`);
+  if (s.avgUtil != null) {
+    parts.push(\`<span class="metric-inline">利用率 <b>\${s.avgUtil}%</b>\${meterHtml(s.avgUtil, false)}</span>\`);
+  }
+  if (s.memPct != null) {
+    parts.push(\`<span class="metric-inline">显存 <b>\${s.memPct}%</b>\${meterHtml(s.memPct, true)}</span>\`);
+  }
+  return \`<span class="gpu-info">\${parts.join('')}</span>\`;
 }
 
-function render(tunnels) {
-  const list = $('list');
-  if (!tunnels.length) {
-    list.innerHTML = '<div class="empty">还没有隧道，在上面添加一个吧</div>';
+function actionsHtml(t) {
+  const running = t.status === 'running';
+  const unreachable = running && t.reachable === false;
+  const parts = [];
+  if (unreachable) {
+    parts.push(\`<button class="btn btn-primary btn-sm" data-act="restart" data-id="\${t.id}">重启</button>\`);
+    parts.push(\`<button class="btn btn-ghost btn-sm" data-act="stop" data-id="\${t.id}">停止</button>\`);
+  } else if (running) {
+    parts.push(\`<button class="btn btn-ghost btn-sm" data-act="stop" data-id="\${t.id}">停止</button>\`);
+  } else {
+    parts.push(\`<button class="btn btn-primary btn-sm" data-act="start" data-id="\${t.id}">启动</button>\`);
+  }
+  parts.push(\`<button class="btn btn-subtle btn-sm" data-act="edit" data-id="\${t.id}">编辑</button>\`);
+  parts.push(\`<button class="btn btn-subtle btn-sm" data-act="log" data-id="\${t.id}">日志</button>\`);
+  parts.push(\`<button class="btn btn-danger btn-sm" data-act="del" data-id="\${t.id}" data-name="\${esc(t.name)}">删除</button>\`);
+  return parts.join('');
+}
+
+function statusPill(t) {
+  const running = t.status === 'running';
+  if (running && t.reachable === false) {
+    return \`<span class="pill unreachable" title="\${esc(t.checkReason || 'SSH 探测失败：远程服务器可能已关机')}">已断开</span>\`;
+  }
+  if (running) return '<span class="pill running">运行中</span>';
+  return '<span class="pill stopped">已停止</span>';
+}
+
+function sshChipHtml(t) {
+  const ssh = 'ssh -p ' + t.port + ' ' + (t.user || 'root') + '@127.0.0.1';
+  const running = t.status === 'running';
+  const ready = running && t.reachable !== false;
+  const cls = ready ? 'ssh-chip ready' : (running ? 'ssh-chip disabled' : 'ssh-chip disabled');
+  const hint = ready ? '复制' : (running ? '不可达' : '未运行');
+  return \`<span class="\${cls}" data-cmd="\${esc(ssh)}" title="\${ready ? '点击复制 ssh 命令' : '隧道未运行或不可达'}">\${esc(ssh)}<span class="copy-hint">\${hint}</span></span>\`;
+}
+
+function detailRowHtml(t) {
+  const g = t.gpu;
+  const s = g ? gpuSummary(g.gpus) : null;
+  const meta = [];
+  if (t.pid) meta.push(\`<span>PID <b>\${t.pid}</b></span>\`);
+  if (t.startedAt) meta.push(\`<span>启动于 <b>\${esc(new Date(t.startedAt).toLocaleString('zh-CN'))}</b></span>\`);
+  if (t.checkedAt) meta.push(\`<span>探测于 <b>\${esc(new Date(t.checkedAt).toLocaleString('zh-CN'))}</b></span>\`);
+  if (t.args) meta.push(\`<span>参数 <b>\${esc(t.args)}</b></span>\`);
+  let body = '';
+  if (s && s.valid.length) {
+    const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
+    const rows = s.valid.map((x) => {
+      const memPct = (x.memUsed != null && x.memTotal) ? Math.round((x.memUsed / x.memTotal) * 100) : null;
+      return \`<tr>
+        <td>\${x.index == null ? '—' : x.index}</td>
+        <td>\${esc(gpuShortName(x.name))}</td>
+        <td><span class="metric-inline">\${x.util == null ? '—' : x.util + '%'}\${meterHtml(x.util, false)}</span></td>
+        <td><span class="metric-inline">\${gb(x.memUsed)} / \${gb(x.memTotal)} GB\${meterHtml(memPct, true)}</span></td>
+        <td>\${x.temp == null ? '—' : x.temp + '℃'}</td>
+        <td>\${x.power == null ? '—' : Math.round(x.power) + ' W'}</td>
+      </tr>\`;
+    }).join('');
+    body = \`<table class="gpu-detail">
+      <thead><tr><th>#</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr></thead>
+      <tbody>\${rows}</tbody>
+    </table>\`;
+  } else if (g && g.error) {
+    body = \`<div class="detail-error">GPU 信息不可用：\${esc(g.error)}</div>\`;
+  } else if (t.status === 'running') {
+    body = \`<div class="detail-error">尚未获取 GPU 数据（节点无 nvidia-smi 或未上报）</div>\`;
+  } else if (t.checkReason) {
+    body = \`<div class="detail-error">\${esc(t.checkReason)}</div>\`;
+  } else {
+    body = \`<div class="detail-error">无更多信息</div>\`;
+  }
+  return \`<div class="detail-panel">
+    \${meta.length ? \`<div class="detail-meta">\${meta.join('')}</div>\` : ''}
+    \${body}
+  </div>\`;
+}
+
+function groupTableHtml(group) {
+  const cols = 7;
+  const rows = group.items.map((t) => {
+    const open = state.expanded.has(t.id);
+    const detail = open ? \`<tr class="detail-row"><td colspan="\${cols}">\${detailRowHtml(t)}</td></tr>\` : '';
+    return \`<tr class="data-row" data-id="\${t.id}">
+      <td class="col-chevron"><button class="chev \${open ? 'open' : ''}" data-act="toggle" data-id="\${t.id}" aria-label="\${open ? '收起' : '展开'}">\${SVG_CHEV}</button></td>
+      <td class="col-name"><span class="name-cell">\${esc(t.name)} \${statusPill(t)}</span></td>
+      <td class="col-url"><span class="url-text" title="\${esc(t.url)}">\${esc(t.url)}</span></td>
+      <td class="col-ssh">\${sshChipHtml(t)}</td>
+      <td class="col-gpu">\${gpuCellHtml(t)}</td>
+      <td class="col-pid">\${t.pid ? esc(String(t.pid)) : '—'}</td>
+      <td class="col-actions">\${actionsHtml(t)}</td>
+    </tr>\${detail}\`;
+  }).join('');
+  return \`<div class="group" data-status="\${group.key}">
+    <header class="group-header">
+      <span class="group-dot"></span>
+      <span class="group-title">\${esc(group.label)}</span>
+      <span class="group-count">\${group.items.length}</span>
+    </header>
+    <div class="table-wrap"><div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th class="col-chevron"></th>
+        <th>名称</th>
+        <th>远程地址</th>
+        <th>SSH</th>
+        <th>GPU 使用</th>
+        <th>PID</th>
+        <th></th>
+      </tr></thead>
+      <tbody>\${rows}</tbody>
+    </table></div></div>
+  </div>\`;
+}
+
+function render() {
+  const m = computeMetrics(state.tunnels);
+  renderTopbarStats(m);
+  renderMetrics(m);
+  const groups = groupTunnels(state.tunnels);
+  const root = $('#groups');
+  if (!groups.length) {
+    root.innerHTML = \`<div class="empty">
+      <div class="title">还没有任何隧道</div>
+      <div>点击右上角「+ 新建隧道」开始添加。</div>
+    </div>\`;
     return;
   }
-  list.innerHTML = tunnels.map((t) => {
-    const running = t.status === 'running';
-    if (t.id === editingId) return editRowHtml(t, running);
-    const ssh = 'ssh -p ' + t.port + ' ' + (t.user || 'root') + '@127.0.0.1';
-    // 运行中但远程探测失败 → 远程不可达（远程关机 / 断网 / 后端下线）
-    const unreachable = running && t.reachable === false;
-    const badge = unreachable
-      ? '<span class="badge unreachable" title="'+esc(t.checkReason||'SSH 探测失败：远程服务器可能已关机')+'">已断开</span>'
-      : '<span class="badge '+(running?'running':'stopped')+'">'+(running?'运行中':'已停止')+'</span>';
-    return \`
-    <div class="row">
-      <div class="info">
-        <div class="name">\${esc(t.name)} \${badge}\${t.pid?'<span class="sub" style="color:var(--muted);font-size:11px">pid '+t.pid+'</span>':''}</div>
-        <div class="url" title="\${esc(t.url)}">\${esc(t.url)}\${t.args?'  ·  '+esc(t.args):''}</div>
-        <div class="ssh \${running&&!unreachable?'ready':'off'}" data-cmd="\${esc(ssh)}" title="点击复制 ssh 指令">\${esc(ssh)} <span class="copy">\${unreachable?'已断开':(running?'点击复制':'未运行')}</span></div>
-        \${gpuBlockHtml(t)}
-      </div>
-      <div class="actions">
-        \${running
-          ? '<button class="btn-stop" data-act="stop" data-id="'+t.id+'">停止</button>'
-          : '<button class="btn-start" data-act="start" data-id="'+t.id+'">启动</button>'}
-        <button class="btn-edit" data-act="edit" data-id="\${t.id}">编辑</button>
-        <button class="btn-ghost" data-act="log" data-id="\${t.id}">日志</button>
-        <button class="btn-del" data-act="del" data-id="\${t.id}" data-name="\${esc(t.name)}">删除</button>
-      </div>
-    </div>\`;
-  }).join('');
+  root.innerHTML = groups.map(groupTableHtml).join('');
 }
 
-// 行内编辑表单：预填当前值，提供「保存」/（运行中再加）「保存并重启」/「取消」。
-function editRowHtml(t, running) {
-  return \`
-    <div class="row editing">
-      <div class="edit-grid">
-        <div class="field"><label>名称</label><input class="e-name" type="text" value="\${esc(t.name)}"></div>
-        <div class="field"><label>远程 URL</label><input class="e-url" type="text" value="\${esc(t.url)}"></div>
-        <div class="field"><label>用户名</label><input class="e-user" type="text" value="\${esc(t.user||'root')}"></div>
-        <div class="field"><label>本地端口</label><input class="e-port" type="number" min="1" max="65535" value="\${esc(t.port)}"></div>
-        <div class="field"><label>额外参数</label><input class="e-args" type="text" value="\${esc(t.args||'')}"></div>
-      </div>
-      <div class="actions">
-        <button class="btn-primary" data-act="save" data-id="\${t.id}">保存</button>
-        \${running ? '<button class="btn-start" data-act="save-restart" data-id="'+t.id+'">保存并重启</button>' : ''}
-        <button class="btn-ghost" data-act="cancel" data-id="\${t.id}">取消</button>
-      </div>
-    </div>\`;
-}
-
+// ---------- 数据刷新 ----------
 async function refresh() {
   try {
     const data = await api('/api/tunnels');
-    lastTunnels = data.tunnels;
-    if (editingId) return;            // 编辑中：保留表单，不被定时刷新覆盖
-    render(data.tunnels);
-  } catch (e) { /* 静默，下一轮重试 */ }
+    state.tunnels = data.tunnels;
+    render();
+  } catch (e) { /* 静默重试 */ }
 }
 
-$('f-add').addEventListener('click', async () => {
+// ---------- 模态：表单 ----------
+function openFormModal(mode, tunnel) {
+  modalMode = mode === 'edit' ? { mode: 'edit', id: tunnel.id, running: tunnel.status === 'running' } : 'create';
+  $('#modal-form-title').textContent = mode === 'edit' ? '编辑隧道' : '新建隧道';
+  $('#m-name').value = tunnel ? (tunnel.name || '') : '';
+  $('#m-url').value  = tunnel ? (tunnel.url || '') : '';
+  $('#m-user').value = tunnel ? (tunnel.user || 'root') : 'root';
+  $('#m-port').value = tunnel ? (tunnel.port || '') : '';
+  $('#m-args').value = tunnel ? (tunnel.args || '') : '';
+  $('#m-submit').textContent = mode === 'edit' ? '保存' : '添加';
+  const restartBtn = $('#m-submit-restart');
+  if (mode === 'edit' && tunnel.status === 'running') {
+    restartBtn.hidden = false;
+  } else {
+    restartBtn.hidden = true;
+  }
+  $('#modal-form').hidden = false;
+  setTimeout(() => $('#m-url').focus(), 30);
+}
+function closeFormModal() {
+  $('#modal-form').hidden = true;
+  modalMode = null;
+}
+async function submitForm(opts) {
   const body = {
-    name: $('f-name').value,
-    url: $('f-url').value,
-    user: $('f-user').value,
-    port: $('f-port').value,
-    args: $('f-args').value,
+    name: $('#m-name').value,
+    url: $('#m-url').value,
+    user: $('#m-user').value,
+    port: $('#m-port').value,
+    args: $('#m-args').value,
   };
   if (!body.url.trim()) return toast('请填写远程 URL', true);
   if (!body.port) return toast('请填写本地端口', true);
   try {
-    await api('/api/tunnels', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    $('f-name').value = ''; $('f-url').value = ''; $('f-user').value = 'root'; $('f-port').value = ''; $('f-args').value = '';
-    toast('已添加');
-    refresh();
-  } catch (e) { toast(e.message, true); }
-});
-
-$('list').addEventListener('click', async (ev) => {
-  // 点击 GPU 概览行：展开/收起该隧道的每块卡明细（纯前端态，不发请求）
-  const gpuEl = ev.target.closest('.gpu-sum');
-  if (gpuEl) {
-    const gid = gpuEl.dataset.gpuId;
-    if (gpuExpanded.has(gid)) gpuExpanded.delete(gid); else gpuExpanded.add(gid);
-    render(lastTunnels);
-    return;
-  }
-  const sshEl = ev.target.closest('.ssh');
-  if (sshEl) {
-    try { await navigator.clipboard.writeText(sshEl.dataset.cmd); toast('已复制: ' + sshEl.dataset.cmd); }
-    catch (_) { toast('复制失败，请手动选择', true); }
-    return;
-  }
-  const btn = ev.target.closest('button[data-act]');
-  if (!btn) return;
-  const { act, id, name } = btn.dataset;
-
-  // 进入编辑：切换该行为表单（不发请求）
-  if (act === 'edit') { editingId = id; render(lastTunnels); return; }
-  // 取消编辑：还原显示
-  if (act === 'cancel') { editingId = null; render(lastTunnels); return; }
-
-  // 保存 / 保存并重启：读取表单值，PUT 更新配置
-  if (act === 'save' || act === 'save-restart') {
-    const row = btn.closest('.row.editing');
-    const body = {
-      name: row.querySelector('.e-name').value,
-      url: row.querySelector('.e-url').value,
-      user: row.querySelector('.e-user').value,
-      port: row.querySelector('.e-port').value,
-      args: row.querySelector('.e-args').value,
-    };
-    if (!body.url.trim()) return toast('请填写远程 URL', true);
-    if (!body.port) return toast('请填写本地端口', true);
-    btn.disabled = true;
-    try {
-      await api('/api/tunnels/'+id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      if (act === 'save-restart') {
-        await api('/api/tunnels/'+id+'/restart', {method:'POST'});
+    if (modalMode === 'create') {
+      await api('/api/tunnels', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      toast('已添加');
+    } else if (modalMode && modalMode.mode === 'edit') {
+      const id = modalMode.id;
+      await api('/api/tunnels/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (opts && opts.restart) {
+        await api('/api/tunnels/' + id + '/restart', { method: 'POST' });
         toast('已保存并用新配置重启');
       } else {
         toast('已保存');
       }
-      editingId = null;
+    }
+    closeFormModal();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+// ---------- 模态：日志 ----------
+async function openLogModal(t) {
+  $('#modal-log-title').textContent = '日志 · ' + t.name;
+  $('#log-content').textContent = '加载中…';
+  $('#modal-log').hidden = false;
+  try {
+    const data = await api('/api/tunnels/' + t.id + '/log');
+    $('#log-content').textContent = data.log && data.log.trim() ? data.log : '(无日志)';
+  } catch (e) {
+    $('#log-content').textContent = '加载失败：' + e.message;
+  }
+}
+function closeLogModal() { $('#modal-log').hidden = true; }
+
+// ---------- 事件 ----------
+document.addEventListener('click', async (ev) => {
+  // 模态背景关闭 / 关闭按钮
+  if (ev.target.matches('.modal-backdrop')) {
+    if (ev.target.id === 'modal-form') closeFormModal();
+    if (ev.target.id === 'modal-log') closeLogModal();
+    return;
+  }
+  if (ev.target.closest('[data-close]')) {
+    const backdrop = ev.target.closest('.modal-backdrop');
+    if (backdrop && backdrop.id === 'modal-form') closeFormModal();
+    if (backdrop && backdrop.id === 'modal-log') closeLogModal();
+    return;
+  }
+
+  // SSH 复制
+  const sshEl = ev.target.closest('.ssh-chip:not(.disabled)');
+  if (sshEl) {
+    try { await navigator.clipboard.writeText(sshEl.dataset.cmd); toast('已复制：' + sshEl.dataset.cmd); }
+    catch (_) { toast('复制失败，请手动选择', true); }
+    return;
+  }
+
+  // 行操作按钮
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const { act, id, name } = btn.dataset;
+
+  if (act === 'toggle') {
+    if (state.expanded.has(id)) state.expanded.delete(id); else state.expanded.add(id);
+    render();
+    return;
+  }
+  if (act === 'edit') {
+    const t = state.tunnels.find((x) => x.id === id);
+    if (t) openFormModal('edit', t);
+    return;
+  }
+  if (act === 'log') {
+    const t = state.tunnels.find((x) => x.id === id);
+    if (t) openLogModal(t);
+    return;
+  }
+  if (act === 'del') {
+    if (!confirm('删除隧道「' + name + '」？若在运行会先停止。')) return;
+    btn.disabled = true;
+    try { await api('/api/tunnels/' + id, { method: 'DELETE' }); toast('已删除'); refresh(); }
+    catch (e) { toast(e.message, true); btn.disabled = false; }
+    return;
+  }
+  if (act === 'start' || act === 'stop' || act === 'restart') {
+    btn.disabled = true;
+    try {
+      await api('/api/tunnels/' + id + '/' + act, { method: 'POST' });
+      toast(act === 'start' ? '已启动' : act === 'stop' ? '已停止' : '已重启');
       refresh();
     } catch (e) { toast(e.message, true); btn.disabled = false; }
     return;
   }
-
-  btn.disabled = true;
-  try {
-    if (act === 'start') { await api('/api/tunnels/'+id+'/start', {method:'POST'}); toast('已启动'); }
-    else if (act === 'stop') { await api('/api/tunnels/'+id+'/stop', {method:'POST'}); toast('已停止'); }
-    else if (act === 'del') {
-      if (!confirm('删除隧道「'+name+'」？若在运行会先停止。')) { btn.disabled = false; return; }
-      await api('/api/tunnels/'+id, {method:'DELETE'}); toast('已删除');
-    } else if (act === 'log') {
-      const data = await api('/api/tunnels/'+id+'/log');
-      alert(data.log || '(无日志)');
-    }
-    refresh();
-  } catch (e) { toast(e.message, true); }
-  finally { btn.disabled = false; }
 });
 
-$('quit').addEventListener('click', async () => {
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    if (!$('#modal-form').hidden) closeFormModal();
+    if (!$('#modal-log').hidden) closeLogModal();
+  }
+});
+
+$('#open-new').addEventListener('click', () => openFormModal('create', null));
+$('#m-submit').addEventListener('click', () => submitForm());
+$('#m-submit-restart').addEventListener('click', () => submitForm({ restart: true }));
+$('#theme-toggle').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  setTheme(cur === 'dark' ? 'light' : 'dark');
+});
+
+$('#quit').addEventListener('click', async () => {
   if (!confirm('退出管理器？\\n将关闭后台进程（释放 7070 端口）。已运行的隧道是独立进程，不受影响，会继续在后台运行。')) return;
   clearInterval(refreshTimer);
-  try {
-    await api('/api/shutdown', { method: 'POST' });
-  } catch (_) { /* 进程可能在响应前就退出了，忽略 */ }
-  document.querySelector('.wrap').innerHTML =
-    '<div class="empty" style="padding:80px 0">管理器后台已关闭（7070 端口已释放），可以安全关掉此标签页。<br><span style="font-size:12px">已运行的隧道仍在后台运行；需要时重新运行 node server.js 即可再次接管。</span></div>';
+  try { await api('/api/shutdown', { method: 'POST' }); } catch (_) {}
+  document.body.innerHTML = '<div style="max-width:560px;margin:120px auto;text-align:center;color:var(--text-muted);font:14px/1.6 -apple-system,sans-serif;padding:20px;"><div style="font-size:16px;color:var(--text);font-weight:600;margin-bottom:10px;">管理器已关闭</div>7070 端口已释放，可以安全关掉此标签页。<br><span style="font-size:12px;color:var(--text-subtle);">已运行的隧道仍在后台运行；需要时重新运行 <code>node server.js</code> 即可再次接管。</span></div>';
 });
 
+// ---------- 启动 ----------
+initAppMode();
+initTheme();
 refresh();
 const refreshTimer = setInterval(refresh, 3000);
 </script>
@@ -1029,34 +1717,47 @@ const refreshTimer = setInterval(refresh, 3000);
 </html>`;
 
 // ---------- 启动 ----------
-ensureDirs();
-migrateLegacy();          // 首次运行时把旧版单文件配置拆成 SHARED_CONFIG + RUNTIME_FILE
-reconcile(loadTunnels()); // 启动即接管已有进程的真实状态
+// 抽成函数：Electron 主进程可 require() 之后调用 startServer()，
+// CLI 直接运行时由文件底部的 `if (require.main === module)` 自动启动。
+function startServer(opts) {
+  opts = opts || {};
+  ensureDirs();
+  migrateLegacy();          // 首次运行时把旧版单文件配置拆成 SHARED_CONFIG + RUNTIME_FILE
+  reconcile(loadTunnels()); // 启动即接管已有进程的真实状态
 
-// 后台周期性探测「运行中」隧道的远程可达性（检测远程关机/断网）
-runHealthChecks();
-setInterval(runHealthChecks, 15000);
+  // 后台周期性探测「运行中」隧道的远程可达性（检测远程关机/断网）
+  runHealthChecks();
+  setInterval(runHealthChecks, 15000);
 
-// 后台周期性查询「运行中」隧道节点的 GPU 使用情况（SSH + nvidia-smi）
-runGpuChecks();
-setInterval(runGpuChecks, 15000);
+  // 后台周期性查询「运行中」隧道节点的 GPU 使用情况（SSH + nvidia-smi）
+  runGpuChecks();
+  setInterval(runGpuChecks, 15000);
 
-server.listen(WEB_PORT, '127.0.0.1', () => {
-  const url = `http://127.0.0.1:${WEB_PORT}`;
-  console.log(`rtunnel 管理器已启动: ${url}`);
-  console.log(`共享配置: ${SHARED_CONFIG}`);
-  console.log(`本机状态: ${RUNTIME_FILE}`);
-  // 尽力自动打开浏览器（仅 macOS，失败忽略）
-  if (process.platform === 'darwin') {
-    execFile('open', [url], () => {});
-  }
-});
+  return new Promise((resolve, reject) => {
+    server.once('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`端口 ${WEB_PORT} 已被占用。可能管理器已在运行，或用 RT_MANAGER_PORT 换个端口。`);
+      } else {
+        console.error('服务器错误:', err.message);
+      }
+      reject(err);
+    });
+    server.listen(WEB_PORT, '127.0.0.1', () => {
+      const url = `http://127.0.0.1:${WEB_PORT}`;
+      console.log(`rtunnel 管理器已启动: ${url}`);
+      console.log(`共享配置: ${SHARED_CONFIG}`);
+      console.log(`本机状态: ${RUNTIME_FILE}`);
+      // Electron 模式下不要自动打开系统浏览器（Electron 会用自己的 BrowserWindow）。
+      if (process.platform === 'darwin' && !opts.skipAutoOpen && !process.env.RT_NO_AUTOOPEN) {
+        execFile('open', [url], () => {});
+      }
+      resolve({ url, port: WEB_PORT });
+    });
+  });
+}
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`端口 ${WEB_PORT} 已被占用。可能管理器已在运行，或用 RT_MANAGER_PORT 换个端口。`);
-  } else {
-    console.error('服务器错误:', err.message);
-  }
-  process.exit(1);
-});
+if (require.main === module) {
+  startServer().catch(() => process.exit(1));
+}
+
+module.exports = { startServer, WEB_PORT };
