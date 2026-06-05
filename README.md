@@ -3,7 +3,17 @@
 一个 Linear 风格的 SSH 隧道管理面板，用来运行 / 关闭 / 管理多个
 [`rtunnel`](https://github.com/yangxikun/rtunnel) 隧道。
 
-两种用法，二选一：
+## 直接下载（macOS Apple Silicon）
+
+最新版本：[**Releases**](https://github.com/SII-ljh/rtunnel-manager/releases/latest) → 下载 `rtunnel-*-arm64.dmg`，拖入 `/Applications` 即用。
+
+首次启动被 Gatekeeper 拦住时（ad-hoc 签名），在「系统设置 → 隐私与安全性」点「仍要打开」，
+或命令行：`xattr -dr com.apple.quarantine /Applications/rtunnel.app`。
+
+> 仅 macOS arm64 (M1/M2/M3/M4) 提供预构建。Intel Mac / Windows / Linux 需自行 `npm run dist` 从源码构建。
+
+## 两种用法
+
 - **桌面 App**（推荐）：双击 `rtunnel.app` 启动，独立窗口、Dock 图标，跟普通 macOS 软件一样。
 - **CLI 模式**：`node server.js`，在浏览器打开 `http://127.0.0.1:7070`。和以前一样。
 
