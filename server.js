@@ -55,6 +55,37 @@ const PROXY_ENV_KEYS = [
   'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy',
 ];
 
+// GUI 启动（双击 .app）继承的是 launchd 的精简 PATH（/usr/bin:/bin:/usr/sbin:/sbin），
+// 不含 Homebrew 路径，于是 spawn('rtunnel') 会 ENOENT。这里补齐常见安装目录。
+const EXTRA_BIN_DIRS = [
+  '/opt/homebrew/bin',   // Apple Silicon Homebrew
+  '/usr/local/bin',      // Intel Homebrew / 手动安装
+  path.join(os.homedir(), '.local', 'bin'),
+  path.join(os.homedir(), 'go', 'bin'), // rtunnel 是 Go 程序，go install 默认落点
+];
+
+// 把缺失的常见 bin 目录补进 PATH，保留原有顺序与内容。
+function augmentedPath() {
+  const cur = (process.env.PATH || '').split(':').filter(Boolean);
+  const merged = cur.slice();
+  for (const d of EXTRA_BIN_DIRS) {
+    if (!merged.includes(d)) merged.push(d);
+  }
+  return merged.join(':');
+}
+
+// 在补齐后的 PATH 里把 rtunnel 解析为绝对路径；找不到返回 null。
+function resolveRtunnelBin() {
+  for (const d of augmentedPath().split(':')) {
+    const p = path.join(d, 'rtunnel');
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
+    } catch (_) { /* 继续找下一个 */ }
+  }
+  return null;
+}
+
 function ensureDirs() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
@@ -386,6 +417,7 @@ async function directConnectionGate(url) {
 function childEnvWithoutProxy() {
   const env = Object.assign({}, process.env);
   for (const k of PROXY_ENV_KEYS) delete env[k];
+  env.PATH = augmentedPath(); // GUI 启动时补齐 Homebrew 等路径，保证子进程也能找到 rtunnel
   return env;
 }
 
@@ -404,9 +436,20 @@ function startTunnel(t) {
     const extra = (t.args || '').trim().length ? t.args.trim().split(/\s+/) : [];
     const args = [t.url, String(t.port), ...extra];
 
+    const bin = resolveRtunnelBin();
+    if (!bin) {
+      fs.closeSync(out);
+      resolve({
+        ok: false,
+        reason: '找不到 rtunnel 命令。请确认已安装（brew/go install），'
+          + `已搜索：${EXTRA_BIN_DIRS.join(', ')}。`,
+      });
+      return;
+    }
+
     let child;
     try {
-      child = spawn('rtunnel', args, {
+      child = spawn(bin, args, {
         detached: true,
         stdio: ['ignore', out, out],
         env: childEnvWithoutProxy(),
