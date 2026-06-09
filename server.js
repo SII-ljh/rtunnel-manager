@@ -24,7 +24,8 @@ const { spawn, execFile } = require('child_process');
 // ---------- 路径与配置 ----------
 // 配置拆成两份，跨设备共享列表但运行状态各管各的：
 //   - SHARED_CONFIG: 跟着 server.js 走（通常在 iCloud / Dropbox 同步目录），
-//     只存"共享字段"——id / name / url / port / user / args。
+//     只存"共享字段"——id / name / url / port / user / args / rtunnelCommand / useSudo / skipDirectCheck。
+//     sudo 密码只在启动请求里临时使用，绝不写入配置文件。
 //     在 A 机加一条隧道，B 机自动也能看到。
 //   - RUNTIME_FILE:  本机 Library 下，按 id 存 { pid, status, startedAt }。
 //     pid 是机器本地编号，绝不能跨设备共享，否则 reconcile() 会把对方机器
@@ -74,16 +75,102 @@ function augmentedPath() {
   return merged.join(':');
 }
 
-// 在补齐后的 PATH 里把 rtunnel 解析为绝对路径；找不到返回 null。
-function resolveRtunnelBin() {
+function resolveBinByName(name) {
   for (const d of augmentedPath().split(':')) {
-    const p = path.join(d, 'rtunnel');
+    const p = path.join(d, name);
     try {
       fs.accessSync(p, fs.constants.X_OK);
       return p;
     } catch (_) { /* 继续找下一个 */ }
   }
   return null;
+}
+
+// 在补齐后的 PATH 里把 rtunnel 解析为绝对路径；找不到返回 null。
+function resolveRtunnelBin() {
+  return resolveBinByName('rtunnel');
+}
+
+function normalizeRtunnelCommand(raw) {
+  const cmd = String(raw || '').trim();
+  if (/[\0\r\n]/.test(cmd)) throw new Error('rtunnel 命令不能包含换行或空字符');
+  return cmd;
+}
+
+function resolveRtunnelCommand(t) {
+  const custom = normalizeRtunnelCommand(t.rtunnelCommand || '');
+  if (!custom) {
+    const bin = resolveRtunnelBin();
+    if (!bin) {
+      return {
+        ok: false,
+        reason: '找不到 rtunnel 命令。请确认已安装（brew/go install），'
+          + `已搜索：${EXTRA_BIN_DIRS.join(', ')}。`,
+      };
+    }
+    return { ok: true, bin, label: 'rtunnel' };
+  }
+
+  if (custom.includes('/')) {
+    try {
+      fs.accessSync(custom, fs.constants.X_OK);
+      return { ok: true, bin: custom, label: custom };
+    } catch (e) {
+      return { ok: false, reason: `自定义 rtunnel 命令不可执行: ${custom}` };
+    }
+  }
+
+  const bin = resolveBinByName(custom);
+  if (!bin) return { ok: false, reason: `找不到自定义 rtunnel 命令: ${custom}` };
+  return { ok: true, bin, label: custom };
+}
+
+function splitArgs(input) {
+  const s = String(input || '').trim();
+  if (!s) return [];
+  const out = [];
+  let cur = '';
+  let quote = null;
+  let escaped = false;
+  let tokenStarted = false;
+  for (const ch of s) {
+    if (escaped) {
+      cur += ch;
+      escaped = false;
+      tokenStarted = true;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      tokenStarted = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (tokenStarted) {
+        out.push(cur);
+        cur = '';
+        tokenStarted = false;
+      }
+      continue;
+    }
+    cur += ch;
+    tokenStarted = true;
+  }
+  if (escaped) cur += '\\';
+  if (quote) throw new Error('额外参数中的引号未闭合');
+  if (tokenStarted) out.push(cur);
+  return out;
 }
 
 function ensureDirs() {
@@ -106,6 +193,9 @@ function migrateLegacy() {
     const shared = list.map((t) => ({
       id: t.id, name: t.name, url: t.url, port: t.port,
       user: t.user || 'root', args: t.args || '',
+      rtunnelCommand: t.rtunnelCommand || '',
+      useSudo: !!t.useSudo,
+      skipDirectCheck: !!t.skipDirectCheck,
     }));
     const runtime = {};
     for (const t of list) {
@@ -153,6 +243,9 @@ function loadTunnels() {
       port: s.port,
       user: s.user || 'root',
       args: s.args || '',
+      rtunnelCommand: s.rtunnelCommand || '',
+      useSudo: !!s.useSudo,
+      skipDirectCheck: !!s.skipDirectCheck,
       pid: r.pid || null,
       status: r.status || 'stopped',
       startedAt: r.startedAt || null,
@@ -167,6 +260,9 @@ function saveTunnels(tunnels) {
   const shared = tunnels.map((t) => ({
     id: t.id, name: t.name, url: t.url, port: t.port,
     user: t.user || 'root', args: t.args || '',
+    rtunnelCommand: t.rtunnelCommand || '',
+    useSudo: !!t.useSudo,
+    skipDirectCheck: !!t.skipDirectCheck,
   }));
   const runtime = {};
   for (const t of tunnels) {
@@ -421,7 +517,7 @@ function childEnvWithoutProxy() {
   return env;
 }
 
-function startTunnel(t) {
+function startTunnel(t, opts = {}) {
   return new Promise((resolve) => {
     const logPath = path.join(LOG_DIR, `${t.id}.log`);
     let out;
@@ -433,28 +529,48 @@ function startTunnel(t) {
     }
     fs.writeSync(out, `\n===== 启动于 ${new Date().toISOString()} =====\n`);
 
-    const extra = (t.args || '').trim().length ? t.args.trim().split(/\s+/) : [];
+    let extra;
+    try {
+      extra = splitArgs(t.args || '');
+    } catch (e) {
+      fs.closeSync(out);
+      resolve({ ok: false, reason: e.message });
+      return;
+    }
     const args = [t.url, String(t.port), ...extra];
 
-    const bin = resolveRtunnelBin();
-    if (!bin) {
+    const resolved = resolveRtunnelCommand(t);
+    if (!resolved.ok) {
       fs.closeSync(out);
-      resolve({
-        ok: false,
-        reason: '找不到 rtunnel 命令。请确认已安装（brew/go install），'
-          + `已搜索：${EXTRA_BIN_DIRS.join(', ')}。`,
-      });
+      resolve({ ok: false, reason: resolved.reason });
       return;
     }
 
+    const useSudo = !!t.useSudo;
+    const sudoPassword = String(opts.sudoPassword || '');
+    if (useSudo && !sudoPassword) {
+      fs.closeSync(out);
+      resolve({ ok: false, reason: '该隧道设置为 sudo 启动，请填写 sudo/root 密码。' });
+      return;
+    }
+
+    const sudoBin = '/usr/bin/sudo';
+    const command = useSudo ? sudoBin : resolved.bin;
+    const spawnArgs = useSudo ? ['-S', '-p', '', '--', resolved.bin, ...args] : args;
+    fs.writeSync(out, `命令: ${useSudo ? 'sudo ' : ''}${resolved.bin} ${args.map((x) => JSON.stringify(x)).join(' ')}\n`);
+
     let child;
     try {
-      child = spawn(bin, args, {
+      child = spawn(command, spawnArgs, {
         detached: true,
-        stdio: ['ignore', out, out],
+        stdio: [useSudo ? 'pipe' : 'ignore', out, out],
         env: childEnvWithoutProxy(),
         cwd: os.homedir(),
       });
+      if (useSudo && child.stdin) {
+        child.stdin.on('error', () => {});
+        child.stdin.end(sudoPassword + '\n');
+      }
     } catch (e) {
       fs.closeSync(out);
       resolve({ ok: false, reason: `启动失败: ${e.message}` });
@@ -497,7 +613,10 @@ function startTunnel(t) {
 
 function stopTunnel(t) {
   if (t.pid && isAlive(t.pid)) {
-    try { process.kill(t.pid, 'SIGTERM'); } catch (_) {}
+    try { process.kill(-t.pid, 'SIGTERM'); }
+    catch (_) {
+      try { process.kill(t.pid, 'SIGTERM'); } catch (_) {}
+    }
   }
   t.pid = null;
   t.status = 'stopped';
@@ -554,6 +673,9 @@ function publicView(tunnels) {
       port: t.port,
       user: t.user || 'root',
       args: t.args || '',
+      rtunnelCommand: t.rtunnelCommand || '',
+      useSudo: !!t.useSudo,
+      skipDirectCheck: !!t.skipDirectCheck,
       status: t.status,
       pid: t.pid || null,
       startedAt: t.startedAt || null,
@@ -603,6 +725,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const url = (body.url || '').trim();
       const port = parseInt(body.port, 10);
+      let rtunnelCommand;
+      try { rtunnelCommand = normalizeRtunnelCommand(body.rtunnelCommand); }
+      catch (e) { return sendJson(res, 400, { error: e.message }); }
       if (!url) return sendJson(res, 400, { error: 'url 不能为空' });
       if (!port || port < 1 || port > 65535) return sendJson(res, 400, { error: '端口无效（1-65535）' });
       const tunnels = loadTunnels();
@@ -613,6 +738,9 @@ const server = http.createServer(async (req, res) => {
         port,
         user: (body.user || '').trim() || 'root',
         args: (body.args || '').trim(),
+        rtunnelCommand,
+        useSudo: !!body.useSudo,
+        skipDirectCheck: !!body.skipDirectCheck,
         pid: null,
         status: 'stopped',
         startedAt: null,
@@ -645,6 +773,9 @@ const server = http.createServer(async (req, res) => {
         const body = await readBody(req);
         const url = (body.url || '').trim();
         const port = parseInt(body.port, 10);
+        let rtunnelCommand;
+        try { rtunnelCommand = normalizeRtunnelCommand(body.rtunnelCommand); }
+        catch (e) { return sendJson(res, 400, { error: e.message }); }
         if (!url) return sendJson(res, 400, { error: 'url 不能为空' });
         if (!port || port < 1 || port > 65535) return sendJson(res, 400, { error: '端口无效（1-65535）' });
         t.url = url;
@@ -652,6 +783,9 @@ const server = http.createServer(async (req, res) => {
         t.name = (body.name || '').trim() || `tunnel-${port}`;
         t.user = (body.user || '').trim() || 'root';
         t.args = (body.args || '').trim();
+        t.rtunnelCommand = rtunnelCommand;
+        t.useSudo = !!body.useSudo;
+        t.skipDirectCheck = !!body.skipDirectCheck;
         saveTunnels(tunnels);
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
@@ -663,21 +797,25 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (method === 'POST' && (action === 'start' || action === 'restart')) {
+        const body = await readBody(req);
         if (action === 'restart') stopTunnel(t);
         if (t.status === 'running' && isAlive(t.pid)) {
           return sendJson(res, 200, { tunnel: publicView([t])[0] });
         }
-        const gate = await directConnectionGate(t.url);
-        if (!gate.ok) {
-          saveTunnels(tunnels);
-          return sendJson(res, 409, { error: `直连校验未通过：${gate.reason}` });
+        if (!t.skipDirectCheck) {
+          const gate = await directConnectionGate(t.url);
+          if (!gate.ok) {
+            saveTunnels(tunnels);
+            return sendJson(res, 409, { error: `直连校验未通过：${gate.reason}` });
+          }
         }
-        const result = await startTunnel(t);
+        const result = await startTunnel(t, { sudoPassword: body.sudoPassword });
         saveTunnels(tunnels);
         if (!result.ok) return sendJson(res, 500, { error: result.reason });
-        // 启动门刚确认过远程网关可达，乐观初始化为"运行中、可达"；
-        // 2s 后做一次真正的端到端 SSH 探测，远程若已关机会很快翻成「已断开」。
-        health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
+        // 启动门确认过远程网关可达时，乐观初始化为"运行中、可达"；
+        // 若用户跳过直连校验，则等待 2s 后的端到端 SSH 探测给出真实状态。
+        if (t.skipDirectCheck) health.delete(t.id);
+        else health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
         setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
         // 顺带查一次 GPU，前端展开时立刻有数据（不必等下一轮 15s 轮询）
         setTimeout(() => { queryGpu(t).catch(() => {}); }, 2000);
@@ -1117,7 +1255,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
   .form-grid .field { margin-bottom: 0; }
 
-  input[type="text"], input[type="number"] {
+  input[type="text"], input[type="number"], input[type="password"] {
     font: inherit;
     font-size: 13px;
     padding: 7px 10px;
@@ -1129,11 +1267,18 @@ const HTML_PAGE = `<!DOCTYPE html>
     transition: border-color .12s, box-shadow .12s;
     width: 100%;
   }
-  input[type="text"]:focus, input[type="number"]:focus {
+  input[type="text"]:focus, input[type="number"]:focus, input[type="password"]:focus {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--focus-ring);
   }
-  input[type="text"]::placeholder, input[type="number"]::placeholder { color: var(--text-subtle); }
+  input[type="text"]::placeholder, input[type="number"]::placeholder, input[type="password"]::placeholder { color: var(--text-subtle); }
+  .check-row {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--text-muted);
+    margin: 2px 0 12px; user-select: none;
+  }
+  .check-row input { margin: 0; }
+  .field[hidden] { display: none; }
 
   pre.log-view {
     margin: 0;
@@ -1245,6 +1390,19 @@ const HTML_PAGE = `<!DOCTYPE html>
         <input id="m-args" type="text" placeholder="--secure">
         <div class="hint">启动前会先直连探测目标 URL；rtunnel 子进程将剔除代理变量直连运行。</div>
       </div>
+      <div class="field">
+        <label for="m-rtunnel-command">rtunnel 命令（可选）</label>
+        <input id="m-rtunnel-command" type="text" placeholder="/opt/homebrew/bin/rtunnel">
+        <div class="hint">留空时自动搜索 PATH；这里只填可执行文件路径或命令名，参数仍填上方。</div>
+      </div>
+      <label class="check-row">
+        <input id="m-use-sudo" type="checkbox">
+        使用 sudo 启动这个 rtunnel 命令
+      </label>
+      <label class="check-row">
+        <input id="m-skip-direct-check" type="checkbox">
+        跳过启动前直连校验
+      </label>
     </div>
     <footer class="modal-footer">
       <button class="btn btn-ghost btn-sm" data-close>取消</button>
@@ -1268,6 +1426,29 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
     <footer class="modal-footer">
       <button class="btn btn-ghost btn-sm" data-close>关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 模态：sudo 密码 -->
+<div class="modal-backdrop" id="modal-sudo" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-sudo-title">
+    <header class="modal-header">
+      <h2 id="modal-sudo-title">sudo 密码</h2>
+      <button class="btn btn-icon" data-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <div class="field">
+        <label for="sudo-password">sudo/root 密码</label>
+        <input id="sudo-password" type="password" autocomplete="current-password" placeholder="不会保存">
+        <div class="hint">用于本次启动或重启 sudo rtunnel；请求完成后前端会清空输入框。</div>
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost btn-sm" data-close>取消</button>
+      <button class="btn btn-primary btn-sm" id="sudo-submit">继续</button>
     </footer>
   </div>
 </div>
@@ -1332,6 +1513,7 @@ const state = {
   expanded: new Set(),  // 展开 GPU 明细的 id
 };
 let modalMode = null;    // null | 'create' | { mode: 'edit', id }
+let sudoAction = null;   // null | { id, act }
 
 // ---------- 数据加工：过滤 / 分组 / 排序 ----------
 // 过滤无关 GPU：memTotal=0 / null（CPU-only 或 nvidia-smi 返回异常）
@@ -1507,6 +1689,9 @@ function detailRowHtml(t) {
   if (t.startedAt) meta.push(\`<span>启动于 <b>\${esc(new Date(t.startedAt).toLocaleString('zh-CN'))}</b></span>\`);
   if (t.checkedAt) meta.push(\`<span>探测于 <b>\${esc(new Date(t.checkedAt).toLocaleString('zh-CN'))}</b></span>\`);
   if (t.args) meta.push(\`<span>参数 <b>\${esc(t.args)}</b></span>\`);
+  if (t.rtunnelCommand) meta.push(\`<span>命令 <b>\${esc(t.rtunnelCommand)}</b></span>\`);
+  if (t.useSudo) meta.push(\`<span><b>sudo</b> 启动</span>\`);
+  if (t.skipDirectCheck) meta.push(\`<span><b>跳过</b> 直连校验</span>\`);
   let body = '';
   if (s && s.valid.length) {
     const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
@@ -1610,6 +1795,9 @@ function openFormModal(mode, tunnel) {
   $('#m-user').value = tunnel ? (tunnel.user || 'root') : 'root';
   $('#m-port').value = tunnel ? (tunnel.port || '') : '';
   $('#m-args').value = tunnel ? (tunnel.args || '') : '';
+  $('#m-rtunnel-command').value = tunnel ? (tunnel.rtunnelCommand || '') : '';
+  $('#m-use-sudo').checked = !!(tunnel && tunnel.useSudo);
+  $('#m-skip-direct-check').checked = !!(tunnel && tunnel.skipDirectCheck);
   $('#m-submit').textContent = mode === 'edit' ? '保存' : '添加';
   const restartBtn = $('#m-submit-restart');
   if (mode === 'edit' && tunnel.status === 'running') {
@@ -1631,6 +1819,9 @@ async function submitForm(opts) {
     user: $('#m-user').value,
     port: $('#m-port').value,
     args: $('#m-args').value,
+    rtunnelCommand: $('#m-rtunnel-command').value,
+    useSudo: $('#m-use-sudo').checked,
+    skipDirectCheck: $('#m-skip-direct-check').checked,
   };
   if (!body.url.trim()) return toast('请填写远程 URL', true);
   if (!body.port) return toast('请填写本地端口', true);
@@ -1640,9 +1831,15 @@ async function submitForm(opts) {
       toast('已添加');
     } else if (modalMode && modalMode.mode === 'edit') {
       const id = modalMode.id;
-      await api('/api/tunnels/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      const saved = await api('/api/tunnels/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
       if (opts && opts.restart) {
-        await api('/api/tunnels/' + id + '/restart', { method: 'POST' });
+        if (body.useSudo) {
+          closeFormModal();
+          refresh();
+          openSudoPasswordModal(saved.tunnel, 'restart');
+          return;
+        }
+        await runTunnelAction(id, 'restart');
         toast('已保存并用新配置重启');
       } else {
         toast('已保存');
@@ -1651,6 +1848,29 @@ async function submitForm(opts) {
     closeFormModal();
     refresh();
   } catch (e) { toast(e.message, true); }
+}
+
+async function runTunnelAction(id, act, sudoPassword) {
+  const opts = { method: 'POST' };
+  if (act === 'start' || act === 'restart' || sudoPassword) {
+    opts.headers = {'Content-Type':'application/json'};
+    opts.body = JSON.stringify(sudoPassword ? { sudoPassword } : {});
+  }
+  return api('/api/tunnels/' + id + '/' + act, opts);
+}
+
+function openSudoPasswordModal(t, act) {
+  sudoAction = { id: t.id, act };
+  $('#modal-sudo-title').textContent = (act === 'restart' ? '重启' : '启动') + ' · ' + t.name;
+  $('#sudo-password').value = '';
+  $('#sudo-submit').textContent = act === 'restart' ? '重启' : '启动';
+  $('#modal-sudo').hidden = false;
+  setTimeout(() => $('#sudo-password').focus(), 30);
+}
+function closeSudoPasswordModal() {
+  $('#modal-sudo').hidden = true;
+  $('#sudo-password').value = '';
+  sudoAction = null;
 }
 
 // ---------- 模态：日志 ----------
@@ -1673,12 +1893,14 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.matches('.modal-backdrop')) {
     if (ev.target.id === 'modal-form') closeFormModal();
     if (ev.target.id === 'modal-log') closeLogModal();
+    if (ev.target.id === 'modal-sudo') closeSudoPasswordModal();
     return;
   }
   if (ev.target.closest('[data-close]')) {
     const backdrop = ev.target.closest('.modal-backdrop');
     if (backdrop && backdrop.id === 'modal-form') closeFormModal();
     if (backdrop && backdrop.id === 'modal-log') closeLogModal();
+    if (backdrop && backdrop.id === 'modal-sudo') closeSudoPasswordModal();
     return;
   }
 
@@ -1720,7 +1942,13 @@ document.addEventListener('click', async (ev) => {
   if (act === 'start' || act === 'stop' || act === 'restart') {
     btn.disabled = true;
     try {
-      await api('/api/tunnels/' + id + '/' + act, { method: 'POST' });
+      const t = state.tunnels.find((x) => x.id === id);
+      if (t && t.useSudo && (act === 'start' || act === 'restart')) {
+        btn.disabled = false;
+        openSudoPasswordModal(t, act);
+        return;
+      }
+      await runTunnelAction(id, act);
       toast(act === 'start' ? '已启动' : act === 'stop' ? '已停止' : '已重启');
       refresh();
     } catch (e) { toast(e.message, true); btn.disabled = false; }
@@ -1732,12 +1960,30 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     if (!$('#modal-form').hidden) closeFormModal();
     if (!$('#modal-log').hidden) closeLogModal();
+    if (!$('#modal-sudo').hidden) closeSudoPasswordModal();
   }
 });
 
 $('#open-new').addEventListener('click', () => openFormModal('create', null));
 $('#m-submit').addEventListener('click', () => submitForm());
 $('#m-submit-restart').addEventListener('click', () => submitForm({ restart: true }));
+$('#sudo-submit').addEventListener('click', async () => {
+  if (!sudoAction) return;
+  const pwd = $('#sudo-password').value;
+  if (!pwd) return toast('请填写 sudo/root 密码', true);
+  const { id, act } = sudoAction;
+  $('#sudo-submit').disabled = true;
+  try {
+    await runTunnelAction(id, act, pwd);
+    toast(act === 'restart' ? '已重启' : '已启动');
+    closeSudoPasswordModal();
+    refresh();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $('#sudo-submit').disabled = false;
+  }
+});
 $('#theme-toggle').addEventListener('click', () => {
   const cur = document.documentElement.getAttribute('data-theme');
   setTheme(cur === 'dark' ? 'light' : 'dark');
