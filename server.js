@@ -56,20 +56,34 @@ const PROXY_ENV_KEYS = [
   'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy',
 ];
 
+function nvmBinDirs() {
+  const root = path.join(os.homedir(), '.nvm', 'versions', 'node');
+  try {
+    return fs.readdirSync(root)
+      .filter((name) => name.startsWith('v'))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map((name) => path.join(root, name, 'bin'));
+  } catch (_) {
+    return [];
+  }
+}
+
 // GUI 启动（双击 .app）继承的是 launchd 的精简 PATH（/usr/bin:/bin:/usr/sbin:/sbin），
-// 不含 Homebrew 路径，于是 spawn('rtunnel') 会 ENOENT。这里补齐常见安装目录。
+// 不含 Homebrew / nvm 路径，于是 spawn('rtunnel'/'wstunnel') 会 ENOENT。
+// 这里补齐常见安装目录。
 const EXTRA_BIN_DIRS = [
   '/opt/homebrew/bin',   // Apple Silicon Homebrew
   '/usr/local/bin',      // Intel Homebrew / 手动安装
   path.join(os.homedir(), '.local', 'bin'),
   path.join(os.homedir(), 'go', 'bin'), // rtunnel 是 Go 程序，go install 默认落点
+  ...nvmBinDirs(),       // npm -g 安装的 wstunnel 常见落点
 ];
 
 // 把缺失的常见 bin 目录补进 PATH，保留原有顺序与内容。
-function augmentedPath() {
+function augmentedPath(prependDirs = []) {
   const cur = (process.env.PATH || '').split(':').filter(Boolean);
-  const merged = cur.slice();
-  for (const d of EXTRA_BIN_DIRS) {
+  const merged = [];
+  for (const d of [...prependDirs, ...cur, ...EXTRA_BIN_DIRS]) {
     if (!merged.includes(d)) merged.push(d);
   }
   return merged.join(':');
@@ -93,7 +107,7 @@ function resolveRtunnelBin() {
 
 function normalizeRtunnelCommand(raw) {
   const cmd = String(raw || '').trim();
-  if (/[\0\r\n]/.test(cmd)) throw new Error('rtunnel 命令不能包含换行或空字符');
+  if (/[\0\r\n]/.test(cmd)) throw new Error('隧道命令不能包含换行或空字符');
   return cmd;
 }
 
@@ -116,13 +130,25 @@ function resolveRtunnelCommand(t) {
       fs.accessSync(custom, fs.constants.X_OK);
       return { ok: true, bin: custom, label: custom };
     } catch (e) {
-      return { ok: false, reason: `自定义 rtunnel 命令不可执行: ${custom}` };
+      return { ok: false, reason: `自定义隧道命令不可执行: ${custom}` };
     }
   }
 
   const bin = resolveBinByName(custom);
-  if (!bin) return { ok: false, reason: `找不到自定义 rtunnel 命令: ${custom}` };
+  if (!bin) return { ok: false, reason: `找不到自定义隧道命令: ${custom}` };
   return { ok: true, bin, label: custom };
+}
+
+function isWstunnelCommand(resolved) {
+  return path.basename(resolved.bin) === 'wstunnel';
+}
+
+function buildTunnelArgs(t, resolved, extra) {
+  if (isWstunnelCommand(resolved)) {
+    // npm 的 wstunnel 默认可能只监听 ::1；显式绑定 127.0.0.1，匹配前端展示的 ssh 命令。
+    return ['-t', `127.0.0.1:${t.port}:127.0.0.1:22`, ...extra, t.url];
+  }
+  return [t.url, String(t.port), ...extra];
 }
 
 function splitArgs(input) {
@@ -510,10 +536,10 @@ async function directConnectionGate(url) {
 }
 
 // ---------- 启动 / 停止 ----------
-function childEnvWithoutProxy() {
+function childEnvWithoutProxy(prependPathDirs = []) {
   const env = Object.assign({}, process.env);
   for (const k of PROXY_ENV_KEYS) delete env[k];
-  env.PATH = augmentedPath(); // GUI 启动时补齐 Homebrew 等路径，保证子进程也能找到 rtunnel
+  env.PATH = augmentedPath(prependPathDirs); // GUI 启动时补齐 Homebrew/nvm 等路径，保证子进程能找到命令和 node
   return env;
 }
 
@@ -537,14 +563,13 @@ function startTunnel(t, opts = {}) {
       resolve({ ok: false, reason: e.message });
       return;
     }
-    const args = [t.url, String(t.port), ...extra];
-
     const resolved = resolveRtunnelCommand(t);
     if (!resolved.ok) {
       fs.closeSync(out);
       resolve({ ok: false, reason: resolved.reason });
       return;
     }
+    const args = buildTunnelArgs(t, resolved, extra);
 
     const useSudo = !!t.useSudo;
     const sudoPassword = String(opts.sudoPassword || '');
@@ -564,7 +589,7 @@ function startTunnel(t, opts = {}) {
       child = spawn(command, spawnArgs, {
         detached: true,
         stdio: [useSudo ? 'pipe' : 'ignore', out, out],
-        env: childEnvWithoutProxy(),
+        env: childEnvWithoutProxy([path.dirname(resolved.bin)]),
         cwd: os.homedir(),
       });
       if (useSudo && child.stdin) {
@@ -1391,13 +1416,13 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div class="hint">启动前会先直连探测目标 URL；rtunnel 子进程将剔除代理变量直连运行。</div>
       </div>
       <div class="field">
-        <label for="m-rtunnel-command">rtunnel 命令（可选）</label>
-        <input id="m-rtunnel-command" type="text" placeholder="/opt/homebrew/bin/rtunnel">
-        <div class="hint">留空时自动搜索 PATH；这里只填可执行文件路径或命令名，参数仍填上方。</div>
+        <label for="m-rtunnel-command">隧道命令（可选）</label>
+        <input id="m-rtunnel-command" type="text" placeholder="/opt/homebrew/bin/rtunnel 或 wstunnel">
+        <div class="hint">留空时自动搜索 rtunnel；填 wstunnel 时会自动转换为 -t 127.0.0.1:本地端口:127.0.0.1:22 URL。</div>
       </div>
       <label class="check-row">
         <input id="m-use-sudo" type="checkbox">
-        使用 sudo 启动这个 rtunnel 命令
+        使用 sudo 启动这个隧道命令
       </label>
       <label class="check-row">
         <input id="m-skip-direct-check" type="checkbox">
