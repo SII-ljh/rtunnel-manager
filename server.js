@@ -272,6 +272,7 @@ function loadTunnels() {
       rtunnelCommand: s.rtunnelCommand || '',
       useSudo: !!s.useSudo,
       skipDirectCheck: !!s.skipDirectCheck,
+      monitorType: s.monitorType === 'cpu' ? 'cpu' : 'gpu',
       pid: r.pid || null,
       status: r.status || 'stopped',
       startedAt: r.startedAt || null,
@@ -289,6 +290,7 @@ function saveTunnels(tunnels) {
     rtunnelCommand: t.rtunnelCommand || '',
     useSudo: !!t.useSudo,
     skipDirectCheck: !!t.skipDirectCheck,
+    monitorType: t.monitorType === 'cpu' ? 'cpu' : 'gpu',
   }));
   const runtime = {};
   for (const t of tunnels) {
@@ -448,12 +450,21 @@ async function runHealthChecks() {
 // gpus 每项: { index, name, util(%), memUsed(MiB), memTotal(MiB), temp(℃), power(W) }
 const gpuStats = new Map();
 
+// CPU/内存 监控的隧道：SSH 进节点采样 /proc，结果同样存内存（不写盘）：
+//   cpuStats: id -> { cpu, memUsed, memTotal, memPct, load, cores, queriedAt, error }
+// cpu(%) 平均利用率、memUsed/memTotal(MiB)、memPct(%)、load(1 分钟负载)、cores(核数)
+const cpuStats = new Map();
+
 const NVIDIA_QUERY = 'nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits';
+
+// 单条 SSH 命令采两次 /proc/stat（间隔 0.7s）算出区间 CPU 利用率，
+// 顺带读内存、负载、核数。输出按行解析，避免依赖 top/mpstat 是否存在。
+const CPU_QUERY = "grep '^cpu ' /proc/stat; sleep 0.7; grep '^cpu ' /proc/stat; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; cat /proc/loadavg; nproc";
 
 // 隧道连的都是 127.0.0.1:<port>，同一端口被不同节点复用会触发 known_hosts 冲突；
 // localhost 隧道场景主机密钥校验意义不大，直接绕过。BatchMode 确保免密不可用时
 // 快速失败而非挂起等密码。
-function gpuSshArgs(t) {
+function metricSshArgs(t, remoteCommand) {
   return [
     '-p', String(t.port),
     '-o', 'BatchMode=yes',
@@ -462,7 +473,7 @@ function gpuSshArgs(t) {
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'LogLevel=ERROR',
     `${t.user || 'root'}@127.0.0.1`,
-    NVIDIA_QUERY,
+    remoteCommand,
   ];
 }
 
@@ -492,7 +503,7 @@ function parseGpuCsv(stdout) {
 
 function queryGpu(t) {
   return new Promise((resolve) => {
-    execFile('ssh', gpuSshArgs(t), {
+    execFile('ssh', metricSshArgs(t, NVIDIA_QUERY), {
       timeout: 8000,
       env: childEnvWithoutProxy(),
       maxBuffer: 1 << 20,
@@ -511,17 +522,84 @@ function queryGpu(t) {
   });
 }
 
-// 查所有运行中隧道的 GPU；非运行的清掉记录。
-async function runGpuChecks() {
+// 解析 CPU_QUERY 的输出：两行 cpu 累计计数 + 内存 + 负载 + 核数。
+function parseCpuOutput(stdout) {
+  const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const cpuLines = lines.filter((l) => /^cpu\s/.test(l));
+  // /proc/stat 的 cpu 行：user nice system idle iowait irq softirq steal ...
+  // idle 时间 = idle + iowait；利用率 = 1 - Δidle/Δtotal。
+  const fields = (l) => l.split(/\s+/).slice(1).map((n) => parseFloat(n)).filter((n) => Number.isFinite(n));
+  let cpu = null;
+  if (cpuLines.length >= 2) {
+    const a = fields(cpuLines[0]);
+    const b = fields(cpuLines[1]);
+    const sum = (arr) => arr.reduce((s, n) => s + n, 0);
+    const idleA = (a[3] || 0) + (a[4] || 0);
+    const idleB = (b[3] || 0) + (b[4] || 0);
+    const totalDelta = sum(b) - sum(a);
+    const idleDelta = idleB - idleA;
+    if (totalDelta > 0) cpu = Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100)));
+  }
+  const memKb = (re) => {
+    const m = lines.find((l) => re.test(l));
+    if (!m) return null;
+    const v = parseFloat(m.replace(/[^0-9.]/g, ''));
+    return Number.isFinite(v) ? v : null;
+  };
+  const memTotalKb = memKb(/^MemTotal:/);
+  const memAvailKb = memKb(/^MemAvailable:/);
+  const memTotal = memTotalKb != null ? Math.round(memTotalKb / 1024) : null;        // MiB
+  const memUsed = (memTotalKb != null && memAvailKb != null)
+    ? Math.round((memTotalKb - memAvailKb) / 1024) : null;                            // MiB
+  const memPct = (memTotal && memUsed != null) ? Math.round((memUsed / memTotal) * 100) : null;
+  const loadLine = lines.find((l) => /^[0-9.]+\s+[0-9.]+\s+[0-9.]+/.test(l));
+  const load = loadLine ? parseFloat(loadLine.split(/\s+/)[0]) : null;
+  const coreLine = [...lines].reverse().find((l) => /^[0-9]+$/.test(l));
+  const cores = coreLine ? parseInt(coreLine, 10) : null;
+  return { cpu, memUsed, memTotal, memPct, load: Number.isFinite(load) ? load : null, cores };
+}
+
+function queryCpu(t) {
+  return new Promise((resolve) => {
+    execFile('ssh', metricSshArgs(t, CPU_QUERY), {
+      timeout: 8000,
+      env: childEnvWithoutProxy(),
+      maxBuffer: 1 << 20,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const reason = (stderr || err.message || '').trim().split(/\r?\n/)[0] || 'CPU 查询失败';
+        cpuStats.set(t.id, { cpu: null, memUsed: null, memTotal: null, memPct: null, load: null, cores: null, queriedAt: new Date().toISOString(), error: reason });
+        resolve();
+        return;
+      }
+      const s = parseCpuOutput(stdout);
+      const ok = s.cpu != null || s.memPct != null;
+      cpuStats.set(t.id, Object.assign(s, { queriedAt: new Date().toISOString(), error: ok ? null : '未解析到 CPU 指标' }));
+      resolve();
+    });
+  });
+}
+
+// 查所有运行中隧道的资源指标；按隧道的 monitorType 选 GPU 或 CPU；非运行的清掉记录。
+async function runMetricChecks() {
   const tunnels = reconcile(loadTunnels());
   const running = [];
   for (const t of tunnels) {
     if (t.status === 'running') running.push(t);
-    else gpuStats.delete(t.id);
+    else { gpuStats.delete(t.id); cpuStats.delete(t.id); }
   }
-  await Promise.all(running.map((t) => queryGpu(t).catch(() => {
-    gpuStats.set(t.id, { gpus: [], queriedAt: new Date().toISOString(), error: 'GPU 查询异常' });
-  })));
+  await Promise.all(running.map((t) => {
+    if (t.monitorType === 'cpu') {
+      gpuStats.delete(t.id);
+      return queryCpu(t).catch(() => {
+        cpuStats.set(t.id, { cpu: null, memUsed: null, memTotal: null, memPct: null, load: null, cores: null, queriedAt: new Date().toISOString(), error: 'CPU 查询异常' });
+      });
+    }
+    cpuStats.delete(t.id);
+    return queryGpu(t).catch(() => {
+      gpuStats.set(t.id, { gpus: [], queriedAt: new Date().toISOString(), error: 'GPU 查询异常' });
+    });
+  }));
 }
 
 // rtunnel 子进程会剔除代理变量（见 childEnvWithoutProxy），始终直连运行——
@@ -691,6 +769,7 @@ function publicView(tunnels) {
   return tunnels.map((t) => {
     const h = health.get(t.id);
     const g = gpuStats.get(t.id);
+    const c = cpuStats.get(t.id);
     return {
       id: t.id,
       name: t.name,
@@ -701,6 +780,7 @@ function publicView(tunnels) {
       rtunnelCommand: t.rtunnelCommand || '',
       useSudo: !!t.useSudo,
       skipDirectCheck: !!t.skipDirectCheck,
+      monitorType: t.monitorType === 'cpu' ? 'cpu' : 'gpu',
       status: t.status,
       pid: t.pid || null,
       startedAt: t.startedAt || null,
@@ -709,7 +789,9 @@ function publicView(tunnels) {
       checkedAt: h ? h.checkedAt : null,
       checkReason: h ? h.reason : null,
       // GPU 使用情况：null = 未查 / 非运行；否则 { gpus, queriedAt, error }
-      gpu: t.status === 'running' && g ? g : null,
+      gpu: t.status === 'running' && t.monitorType !== 'cpu' && g ? g : null,
+      // CPU/内存 使用情况：null = 未查 / 非运行 / 非 CPU 监控；否则 { cpu, memUsed, ... }
+      cpu: t.status === 'running' && t.monitorType === 'cpu' && c ? c : null,
     };
   });
 }
@@ -766,6 +848,7 @@ const server = http.createServer(async (req, res) => {
         rtunnelCommand,
         useSudo: !!body.useSudo,
         skipDirectCheck: !!body.skipDirectCheck,
+        monitorType: body.monitorType === 'cpu' ? 'cpu' : 'gpu',
         pid: null,
         status: 'stopped',
         startedAt: null,
@@ -811,6 +894,9 @@ const server = http.createServer(async (req, res) => {
         t.rtunnelCommand = rtunnelCommand;
         t.useSudo = !!body.useSudo;
         t.skipDirectCheck = !!body.skipDirectCheck;
+        t.monitorType = body.monitorType === 'cpu' ? 'cpu' : 'gpu';
+        // 监控类型改变时，清掉旧类型残留的内存指标，避免前端显示串台
+        gpuStats.delete(t.id); cpuStats.delete(t.id);
         saveTunnels(tunnels);
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
@@ -842,8 +928,10 @@ const server = http.createServer(async (req, res) => {
         if (t.skipDirectCheck) health.delete(t.id);
         else health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
         setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
-        // 顺带查一次 GPU，前端展开时立刻有数据（不必等下一轮 15s 轮询）
-        setTimeout(() => { queryGpu(t).catch(() => {}); }, 2000);
+        // 顺带查一次资源指标，前端展开时立刻有数据（不必等下一轮 15s 轮询）
+        setTimeout(() => {
+          (t.monitorType === 'cpu' ? queryCpu(t) : queryGpu(t)).catch(() => {});
+        }, 2000);
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
     }
@@ -1303,6 +1391,8 @@ const HTML_PAGE = `<!DOCTYPE html>
     margin: 2px 0 12px; user-select: none;
   }
   .check-row input { margin: 0; }
+  .seg { display: flex; flex-wrap: wrap; gap: 16px; }
+  .seg .check-row { margin: 2px 0; }
   .field[hidden] { display: none; }
 
   pre.log-view {
@@ -1419,6 +1509,14 @@ const HTML_PAGE = `<!DOCTYPE html>
         <label for="m-rtunnel-command">隧道命令（可选）</label>
         <input id="m-rtunnel-command" type="text" placeholder="/opt/homebrew/bin/rtunnel 或 wstunnel">
         <div class="hint">留空时自动搜索 rtunnel；填 wstunnel 时会自动转换为 -t 127.0.0.1:本地端口:127.0.0.1:22 URL。</div>
+      </div>
+      <div class="field">
+        <label>监控指标</label>
+        <div class="seg">
+          <label class="check-row"><input type="radio" name="m-monitor" value="gpu" checked> GPU（显存 / 利用率）</label>
+          <label class="check-row"><input type="radio" name="m-monitor" value="cpu"> CPU（CPU / 内存利用率）</label>
+        </div>
+        <div class="hint">GPU：SSH 跑 nvidia-smi；CPU：SSH 采样 /proc 算 CPU 与内存利用率。</div>
       </div>
       <label class="check-row">
         <input id="m-use-sudo" type="checkbox">
@@ -1670,6 +1768,29 @@ function gpuCellHtml(t) {
   return \`<span class="gpu-info">\${parts.join('')}</span>\`;
 }
 
+function cpuCellHtml(t) {
+  const c = t.cpu;
+  if (!c) return '<span class="gpu-info-dim">—</span>';
+  if (c.cpu == null && c.memPct == null) {
+    if (c.error) return '<span class="gpu-info-dim" title="' + esc(c.error) + '">无 CPU 数据</span>';
+    return '<span class="gpu-info-dim">—</span>';
+  }
+  const parts = [];
+  parts.push(\`<span class="gpu-model">🖥 CPU\${c.cores ? ' · ' + c.cores + ' 核' : ''}</span>\`);
+  if (c.cpu != null) {
+    parts.push(\`<span class="metric-inline">利用率 <b>\${c.cpu}%</b>\${meterHtml(c.cpu, true)}</span>\`);
+  }
+  if (c.memPct != null) {
+    parts.push(\`<span class="metric-inline">内存 <b>\${c.memPct}%</b>\${meterHtml(c.memPct, true)}</span>\`);
+  }
+  return \`<span class="gpu-info">\${parts.join('')}</span>\`;
+}
+
+// 按隧道监控类型分发：CPU 监控显示 CPU/内存，否则保持 GPU 现状。
+function metricCellHtml(t) {
+  return t.monitorType === 'cpu' ? cpuCellHtml(t) : gpuCellHtml(t);
+}
+
 function actionsHtml(t) {
   const running = t.status === 'running';
   const unreachable = running && t.reachable === false;
@@ -1706,6 +1827,26 @@ function sshChipHtml(t) {
   return \`<span class="\${cls}" data-cmd="\${esc(ssh)}" title="\${ready ? '点击复制 ssh 命令' : '隧道未运行或不可达'}">\${esc(ssh)}<span class="copy-hint">\${hint}</span></span>\`;
 }
 
+function cpuDetailHtml(t) {
+  const c = t.cpu;
+  if (c && (c.cpu != null || c.memPct != null)) {
+    const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
+    return \`<table class="gpu-detail">
+      <thead><tr><th>CPU 利用率</th><th>核数</th><th>内存</th><th>1 分钟负载</th></tr></thead>
+      <tbody><tr>
+        <td><span class="metric-inline">\${c.cpu == null ? '—' : c.cpu + '%'}\${meterHtml(c.cpu, true)}</span></td>
+        <td>\${c.cores == null ? '—' : c.cores}</td>
+        <td><span class="metric-inline">\${gb(c.memUsed)} / \${gb(c.memTotal)} GB\${meterHtml(c.memPct, true)}</span></td>
+        <td>\${c.load == null ? '—' : c.load.toFixed(2)}</td>
+      </tr></tbody>
+    </table>\`;
+  }
+  if (c && c.error) return \`<div class="detail-error">CPU 信息不可用：\${esc(c.error)}</div>\`;
+  if (t.status === 'running') return \`<div class="detail-error">尚未获取 CPU 数据（节点不可达或未上报）</div>\`;
+  if (t.checkReason) return \`<div class="detail-error">\${esc(t.checkReason)}</div>\`;
+  return \`<div class="detail-error">无更多信息</div>\`;
+}
+
 function detailRowHtml(t) {
   const g = t.gpu;
   const s = g ? gpuSummary(g.gpus) : null;
@@ -1718,7 +1859,9 @@ function detailRowHtml(t) {
   if (t.useSudo) meta.push(\`<span><b>sudo</b> 启动</span>\`);
   if (t.skipDirectCheck) meta.push(\`<span><b>跳过</b> 直连校验</span>\`);
   let body = '';
-  if (s && s.valid.length) {
+  if (t.monitorType === 'cpu') {
+    body = cpuDetailHtml(t);
+  } else if (s && s.valid.length) {
     const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
     const rows = s.valid.map((x) => {
       const memPct = (x.memUsed != null && x.memTotal) ? Math.round((x.memUsed / x.memTotal) * 100) : null;
@@ -1760,7 +1903,7 @@ function groupTableHtml(group) {
       <td class="col-name"><span class="name-cell">\${esc(t.name)} \${statusPill(t)}</span></td>
       <td class="col-url"><span class="url-text" title="\${esc(t.url)}">\${esc(t.url)}</span></td>
       <td class="col-ssh">\${sshChipHtml(t)}</td>
-      <td class="col-gpu">\${gpuCellHtml(t)}</td>
+      <td class="col-gpu">\${metricCellHtml(t)}</td>
       <td class="col-pid">\${t.pid ? esc(String(t.pid)) : '—'}</td>
       <td class="col-actions">\${actionsHtml(t)}</td>
     </tr>\${detail}\`;
@@ -1777,7 +1920,7 @@ function groupTableHtml(group) {
         <th>名称</th>
         <th>远程地址</th>
         <th>SSH</th>
-        <th>GPU 使用</th>
+        <th>资源使用</th>
         <th>PID</th>
         <th></th>
       </tr></thead>
@@ -1823,6 +1966,9 @@ function openFormModal(mode, tunnel) {
   $('#m-rtunnel-command').value = tunnel ? (tunnel.rtunnelCommand || '') : '';
   $('#m-use-sudo').checked = !!(tunnel && tunnel.useSudo);
   $('#m-skip-direct-check').checked = !!(tunnel && tunnel.skipDirectCheck);
+  const monitorType = (tunnel && tunnel.monitorType === 'cpu') ? 'cpu' : 'gpu';
+  const monitorRadio = $('input[name="m-monitor"][value="' + monitorType + '"]');
+  if (monitorRadio) monitorRadio.checked = true;
   $('#m-submit').textContent = mode === 'edit' ? '保存' : '添加';
   const restartBtn = $('#m-submit-restart');
   if (mode === 'edit' && tunnel.status === 'running') {
@@ -1847,6 +1993,7 @@ async function submitForm(opts) {
     rtunnelCommand: $('#m-rtunnel-command').value,
     useSudo: $('#m-use-sudo').checked,
     skipDirectCheck: $('#m-skip-direct-check').checked,
+    monitorType: (($('input[name="m-monitor"]:checked') || {}).value === 'cpu') ? 'cpu' : 'gpu',
   };
   if (!body.url.trim()) return toast('请填写远程 URL', true);
   if (!body.port) return toast('请填写本地端口', true);
@@ -1986,6 +2133,12 @@ document.addEventListener('keydown', (ev) => {
     if (!$('#modal-form').hidden) closeFormModal();
     if (!$('#modal-log').hidden) closeLogModal();
     if (!$('#modal-sudo').hidden) closeSudoPasswordModal();
+    return;
+  }
+  // Enter 直接确认当前打开的模态（输入法组合中、Shift+Enter 不触发）
+  if (ev.key === 'Enter' && !ev.isComposing && !ev.shiftKey) {
+    if (!$('#modal-sudo').hidden) { ev.preventDefault(); $('#sudo-submit').click(); return; }
+    if (!$('#modal-form').hidden) { ev.preventDefault(); submitForm(); return; }
   }
 });
 
@@ -2043,9 +2196,9 @@ function startServer(opts) {
   runHealthChecks();
   setInterval(runHealthChecks, 15000);
 
-  // 后台周期性查询「运行中」隧道节点的 GPU 使用情况（SSH + nvidia-smi）
-  runGpuChecks();
-  setInterval(runGpuChecks, 15000);
+  // 后台周期性查询「运行中」隧道节点的资源使用情况（SSH + nvidia-smi / /proc）
+  runMetricChecks();
+  setInterval(runMetricChecks, 15000);
 
   return new Promise((resolve, reject) => {
     server.once('error', (err) => {

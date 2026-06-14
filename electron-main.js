@@ -85,6 +85,26 @@ function createWindow() {
       shell.openExternal(url);
     }
   });
+  // 右键上下文菜单：在输入框里支持全选 / 粘贴 / 复制 / 剪切 / 撤销等。
+  // 根据 editFlags 启用/禁用对应项；非可编辑区域只给「复制 / 全选」。
+  mainWindow.webContents.on('context-menu', (_ev, params) => {
+    const f = params.editFlags || {};
+    const items = [];
+    if (params.isEditable) {
+      items.push({ role: 'undo', label: '撤销', enabled: !!f.canUndo });
+      items.push({ role: 'redo', label: '重做', enabled: !!f.canRedo });
+      items.push({ type: 'separator' });
+      items.push({ role: 'cut', label: '剪切', enabled: !!f.canCut });
+    }
+    items.push({ role: 'copy', label: '复制', enabled: !!f.canCopy });
+    if (params.isEditable) {
+      items.push({ role: 'paste', label: '粘贴', enabled: !!f.canPaste });
+    }
+    items.push({ type: 'separator' });
+    items.push({ role: 'selectAll', label: '全选' });
+    Menu.buildFromTemplate(items).popup({ window: mainWindow });
+  });
+
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
