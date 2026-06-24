@@ -324,6 +324,353 @@ function isAlive(pid) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForExit(pid, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await sleep(100);
+  }
+  return !isAlive(pid);
+}
+
+function signalPid(pid, signal, group) {
+  try {
+    process.kill(group ? -pid : pid, signal);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: e.code || 'KILL_FAILED', reason: e.message };
+  }
+}
+
+function sudoKill(pid, signal, opts = {}) {
+  return new Promise((resolve) => {
+    const sudoPassword = String(opts.sudoPassword || '');
+    if (!sudoPassword) {
+      resolve({ ok: false, code: 'SUDO_REQUIRED', reason: '需要 sudo/root 密码。' });
+      return;
+    }
+    const target = opts.group ? `-${pid}` : String(pid);
+    const child = spawn('/usr/bin/sudo', ['-S', '-p', '', '--', '/bin/kill', `-${signal}`, '--', target], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+      env: childEnvWithoutProxy(),
+      cwd: os.homedir(),
+    });
+    let stderr = '';
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', (err) => finish({ ok: false, code: err.code || 'SUDO_FAILED', reason: err.message }));
+    child.on('close', (code) => {
+      if (code === 0) finish({ ok: true });
+      else finish({
+        ok: false,
+        code: code === 1 ? 'SUDO_FAILED' : `SUDO_EXIT_${code}`,
+        reason: (stderr || '').trim().split(/\r?\n/)[0] || 'sudo kill 失败',
+      });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(sudoPassword + '\n');
+  });
+}
+
+async function stopPid(pid, opts = {}) {
+  pid = parseInt(pid, 10);
+  if (!pid || pid < 1) return { ok: true };
+  if (pid === process.pid) {
+    return { ok: false, code: 'REFUSE_SELF', reason: '拒绝停止管理器自身进程。' };
+  }
+  if (!isAlive(pid)) return { ok: true };
+
+  const useSudo = !!opts.useSudo || !!opts.sudoPassword;
+  const trySignal = async (signal) => {
+    const groupFirst = !!opts.group;
+    const plainGroup = groupFirst ? signalPid(pid, signal, true) : { ok: false, code: 'SKIPPED' };
+    if (plainGroup.ok) return { ok: true };
+    const plainPid = signalPid(pid, signal, false);
+    if (plainPid.ok) return { ok: true };
+
+    const needsSudo = plainGroup.code === 'EPERM' || plainPid.code === 'EPERM' || useSudo;
+    if (!needsSudo) return plainPid;
+    if (!opts.sudoPassword) {
+      return { ok: false, code: 'SUDO_REQUIRED', reason: '停止 sudo 启动的进程需要 sudo/root 密码。' };
+    }
+    if (groupFirst) {
+      const sudoGroup = await sudoKill(pid, signal, { sudoPassword: opts.sudoPassword, group: true });
+      if (sudoGroup.ok) return { ok: true };
+    }
+    return sudoKill(pid, signal, { sudoPassword: opts.sudoPassword, group: false });
+  };
+
+  const term = await trySignal('TERM');
+  if (!term.ok) return term;
+  if (await waitForExit(pid, 2000)) return { ok: true };
+
+  const kill = await trySignal('KILL');
+  if (!kill.ok) return kill;
+  if (await waitForExit(pid, 1500)) return { ok: true };
+  return { ok: false, code: 'STILL_RUNNING', reason: `进程 ${pid} 仍在运行。` };
+}
+
+function parseLsofOutput(stdout) {
+  const processes = [];
+  let cur = null;
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    if (!line) continue;
+    const key = line[0];
+    const value = line.slice(1);
+    if (key === 'p') {
+      if (cur) processes.push(cur);
+      cur = { pid: parseInt(value, 10), command: '', name: '' };
+    } else if (cur && key === 'c') {
+      cur.command = value;
+    } else if (cur && key === 'n') {
+      cur.name = value;
+    }
+  }
+  if (cur) processes.push(cur);
+  return processes.filter((p) => Number.isFinite(p.pid) && p.pid > 0);
+}
+
+function parsePsOutput(stdout) {
+  return String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+      if (!m) return null;
+      const args = m[4].trim();
+      const command = path.basename((args.split(/\s+/)[0] || '').trim());
+      return {
+        pid: parseInt(m[1], 10),
+        ppid: parseInt(m[2], 10),
+        pgid: parseInt(m[3], 10),
+        command,
+        name: args,
+        args,
+      };
+    })
+    .filter((p) => p && Number.isFinite(p.pid) && p.pid > 0);
+}
+
+function listPortListeners(port) {
+  return new Promise((resolve) => {
+    const lsofBin = fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+    try {
+      execFile(lsofBin, ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpcn'], {
+        env: childEnvWithoutProxy(),
+        timeout: 2500,
+        maxBuffer: 1 << 20,
+      }, (err, stdout) => {
+        if (err && err.code === 'ENOENT') return resolve([]);
+        if (err && !stdout) return resolve([]);
+        resolve(parseLsofOutput(stdout));
+      });
+    } catch (_) {
+      resolve([]);
+    }
+  });
+}
+
+function listProcesses() {
+  return new Promise((resolve) => {
+    try {
+      execFile('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,args='], {
+        env: childEnvWithoutProxy(),
+        timeout: 2500,
+        maxBuffer: 4 << 20,
+      }, (err, stdout) => {
+        if (err && !stdout) return resolve([]);
+        resolve(parsePsOutput(stdout));
+      });
+    } catch (_) {
+      resolve([]);
+    }
+  });
+}
+
+function canConnectLocalPort(port, timeoutMs = 350) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch (_) {}
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, '127.0.0.1');
+  });
+}
+
+function processHasPortArg(processInfo, port) {
+  const portText = String(port);
+  const args = String(processInfo.args || processInfo.name || '');
+  const tokens = args.split(/\s+/).filter(Boolean);
+  if (tokens.includes(portText)) return true;
+  return args.includes(`127.0.0.1:${portText}:`) || args.includes(`localhost:${portText}:`);
+}
+
+function processArgsMentionTunnelCommand(t, processInfo) {
+  const args = String(processInfo.args || processInfo.name || '').toLowerCase();
+  const command = path.basename(String(processInfo.command || '')).toLowerCase();
+  for (const name of tunnelProcessNames(t)) {
+    if (command === name) return true;
+    if (args.includes(`/${name}`) || args.includes(` ${name}`) || args.startsWith(`${name} `)) return true;
+  }
+  return false;
+}
+
+function processMatchesTunnelPort(t, processInfo) {
+  return processHasPortArg(processInfo, t.port) && processArgsMentionTunnelCommand(t, processInfo);
+}
+
+function detectedTunnelCommand(t, processes) {
+  for (const p of processes) {
+    const command = path.basename(String(p.command || '')).toLowerCase();
+    if (tunnelProcessNames(t).has(command)) return command;
+  }
+  const args = processes.map((p) => String(p.args || p.name || '').toLowerCase()).join(' ');
+  for (const name of tunnelProcessNames(t)) {
+    if (args.includes(`/${name}`) || args.includes(` ${name}`)) return name;
+  }
+  return 'rtunnel';
+}
+
+async function listTunnelProcessesByPort(port, t) {
+  if (!t) return [];
+  const processes = await listProcesses();
+  const matches = processes.filter((p) => processMatchesTunnelPort(t, p));
+  if (!matches.length) return [];
+
+  const byPid = new Map(processes.map((p) => [p.pid, p]));
+  const byGroup = new Map();
+  for (const p of matches) {
+    const pgid = p.pgid || p.pid;
+    if (!byGroup.has(pgid)) byGroup.set(pgid, []);
+    byGroup.get(pgid).push(p);
+  }
+
+  const result = [];
+  for (const [pgid, members] of byGroup.entries()) {
+    const leader = byPid.get(pgid) || members.find((p) => p.pid === pgid) || members[0];
+    result.push({
+      pid: leader.pid,
+      pgid,
+      command: detectedTunnelCommand(t, members),
+      name: leader.args || leader.name || '',
+      args: leader.args || leader.name || '',
+      group: true,
+      isTunnelProcess: true,
+    });
+  }
+  return result;
+}
+
+async function getPortOccupants(port, t) {
+  const processes = await listPortListeners(port);
+  if (processes.length) return { occupied: true, processes };
+  const tunnelProcesses = await listTunnelProcessesByPort(port, t);
+  if (tunnelProcesses.length) return { occupied: true, processes: tunnelProcesses };
+  return { occupied: await canConnectLocalPort(port), processes: [] };
+}
+
+function describePortOccupants(portInfo) {
+  if (!portInfo.processes || !portInfo.processes.length) return '未能识别监听进程';
+  return portInfo.processes
+    .map((p) => `${p.command || '进程'} PID ${p.pid}`)
+    .join('，');
+}
+
+function publicPortProcesses(portInfo) {
+  return (portInfo.processes || []).map((p) => ({
+    pid: p.pid,
+    command: p.command || '',
+    name: p.name || '',
+  }));
+}
+
+function tunnelProcessNames(t) {
+  const names = new Set(['rtunnel', 'wstunnel']);
+  const custom = String(t.rtunnelCommand || '').trim();
+  if (custom) names.add(path.basename(custom).toLowerCase());
+  return names;
+}
+
+function isTunnelPortProcess(t, processInfo) {
+  if (processInfo.isTunnelProcess) return true;
+  if (processInfo.args && processMatchesTunnelPort(t, processInfo)) return true;
+  const command = path.basename(String(processInfo.command || '')).toLowerCase();
+  if (!command) return false;
+  return tunnelProcessNames(t).has(command);
+}
+
+function classifyPortOccupants(t, portInfo) {
+  if (!portInfo.processes || !portInfo.processes.length) {
+    return { canStop: false, reason: '无法识别监听进程，出于安全考虑不自动停止。' };
+  }
+  const unsafe = portInfo.processes.filter((p) => !isTunnelPortProcess(t, p));
+  if (unsafe.length) {
+    return {
+      canStop: false,
+      reason: `监听进程不是 rtunnel/wstunnel 或当前隧道命令（${describePortOccupants({ processes: unsafe })}），不会自动停止。`,
+    };
+  }
+  return { canStop: true, reason: null };
+}
+
+async function stopPortOccupants(port, opts = {}) {
+  const before = await getPortOccupants(port, opts.tunnel);
+  if (!before.occupied) return { ok: true };
+  if (!before.processes.length) {
+    return { ok: false, code: 'PORT_IN_USE', reason: `本地端口 ${port} 已被占用，但无法识别监听进程。`, portInfo: before };
+  }
+  if (opts.canStopProcess) {
+    const unsafe = before.processes.filter((p) => !opts.canStopProcess(p));
+    if (unsafe.length) {
+      return {
+        ok: false,
+        code: 'PORT_IN_USE',
+        reason: `端口 ${port} 被非隧道进程占用（${describePortOccupants({ processes: unsafe })}），不会自动停止。`,
+        portInfo: before,
+      };
+    }
+  }
+
+  for (const p of before.processes) {
+    const stopped = await stopPid(p.pid, {
+      useSudo: !!opts.sudoPassword,
+      sudoPassword: opts.sudoPassword,
+      group: !!p.group,
+    });
+    if (!stopped.ok) {
+      return Object.assign(stopped, {
+        reason: stopped.code === 'SUDO_REQUIRED'
+          ? `停止占用端口 ${port} 的旧进程需要 sudo/root 密码。`
+          : `无法停止占用端口 ${port} 的旧进程（${p.command || '进程'} PID ${p.pid}）：${stopped.reason}`,
+        portInfo: before,
+      });
+    }
+  }
+
+  for (let i = 0; i < 15; i++) {
+    const after = await getPortOccupants(port, opts.tunnel);
+    if (!after.occupied) return { ok: true };
+    await sleep(120);
+  }
+  return { ok: false, code: 'PORT_STILL_IN_USE', reason: `端口 ${port} 仍被占用。`, portInfo: await getPortOccupants(port, opts.tunnel) };
+}
+
 // 启动时重新接管：刷新每条隧道的真实状态
 function reconcile(tunnels) {
   let changed = false;
@@ -450,16 +797,48 @@ async function runHealthChecks() {
 // gpus 每项: { index, name, util(%), memUsed(MiB), memTotal(MiB), temp(℃), power(W) }
 const gpuStats = new Map();
 
-// CPU/内存 监控的隧道：SSH 进节点采样 /proc，结果同样存内存（不写盘）：
+// CPU/内存 监控的隧道：SSH 进节点采样 /proc + cgroup，结果同样存内存（不写盘）：
 //   cpuStats: id -> { cpu, memUsed, memTotal, memPct, load, cores, queriedAt, error }
-// cpu(%) 平均利用率、memUsed/memTotal(MiB)、memPct(%)、load(1 分钟负载)、cores(核数)
+// cpu(%) 按调度限额归一化后的利用率、memUsed/memTotal(MiB)、memPct(%)、load(1 分钟负载)、cores(可用 CPU)
 const cpuStats = new Map();
 
 const NVIDIA_QUERY = 'nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits';
 
-// 单条 SSH 命令采两次 /proc/stat（间隔 0.7s）算出区间 CPU 利用率，
-// 顺带读内存、负载、核数。输出按行解析，避免依赖 top/mpstat 是否存在。
-const CPU_QUERY = "grep '^cpu ' /proc/stat; sleep 0.7; grep '^cpu ' /proc/stat; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; cat /proc/loadavg; nproc";
+// 单条 SSH 命令采两次 CPU 计数（间隔 0.7s）算出区间 CPU 利用率。
+// 调度系统 / 容器里 /proc/stat、/proc/meminfo、nproc 经常是宿主机视角；
+// 因此优先读取 cgroup v2/v1 的 CPU quota、CPU usage、cpuset 和 memory limit/current。
+const CPU_QUERY = `
+read_cpu_usage_usec() {
+  if [ -r /sys/fs/cgroup/cpu.stat ]; then
+    awk '/^usage_usec / { print $2; found=1 } END { if (!found) print "" }' /sys/fs/cgroup/cpu.stat
+  elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
+    awk '{ printf "%.0f\\n", $1 / 1000 }' /sys/fs/cgroup/cpuacct/cpuacct.usage
+  else
+    echo ""
+  fi
+}
+echo "__CPU_A__ $(grep '^cpu ' /proc/stat 2>/dev/null)"
+echo "__CGROUP_CPU_USAGE_A__ $(read_cpu_usage_usec)"
+echo "__TIME_A_NS__ $(date +%s%N 2>/dev/null)"
+sleep 0.7
+echo "__CPU_B__ $(grep '^cpu ' /proc/stat 2>/dev/null)"
+echo "__CGROUP_CPU_USAGE_B__ $(read_cpu_usage_usec)"
+echo "__TIME_B_NS__ $(date +%s%N 2>/dev/null)"
+echo "__MEMINFO__"
+grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null
+echo "__LOAD__ $(cat /proc/loadavg 2>/dev/null)"
+echo "__NPROC__ $(nproc 2>/dev/null)"
+[ -r /sys/fs/cgroup/cpu.max ] && echo "__CGROUP_CPU_MAX__ $(cat /sys/fs/cgroup/cpu.max)"
+[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && echo "__CGROUP_CPU_QUOTA_US__ $(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+[ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ] && echo "__CGROUP_CPU_PERIOD_US__ $(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+[ -r /sys/fs/cgroup/cpuset.cpus.effective ] && echo "__CGROUP_CPUSET__ $(cat /sys/fs/cgroup/cpuset.cpus.effective)"
+[ -r /sys/fs/cgroup/cpuset/cpuset.cpus ] && echo "__CGROUP_CPUSET__ $(cat /sys/fs/cgroup/cpuset/cpuset.cpus)"
+[ -r /sys/fs/cgroup/memory.max ] && echo "__CGROUP_MEM_MAX__ $(cat /sys/fs/cgroup/memory.max)"
+[ -r /sys/fs/cgroup/memory.current ] && echo "__CGROUP_MEM_CURRENT__ $(cat /sys/fs/cgroup/memory.current)"
+[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ] && echo "__CGROUP_MEM_MAX__ $(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+[ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ] && echo "__CGROUP_MEM_CURRENT__ $(cat /sys/fs/cgroup/memory/memory.usage_in_bytes)"
+true
+`;
 
 // 隧道连的都是 127.0.0.1:<port>，同一端口被不同节点复用会触发 known_hosts 冲突；
 // localhost 隧道场景主机密钥校验意义不大，直接绕过。BatchMode 确保免密不可用时
@@ -522,15 +901,94 @@ function queryGpu(t) {
   });
 }
 
-// 解析 CPU_QUERY 的输出：两行 cpu 累计计数 + 内存 + 负载 + 核数。
+function parseNumericLine(lines, prefix) {
+  const line = lines.find((l) => l.startsWith(prefix));
+  if (!line) return null;
+  const v = parseFloat(line.slice(prefix.length).trim());
+  return Number.isFinite(v) ? v : null;
+}
+
+function parseTextLine(lines, prefix) {
+  const line = lines.find((l) => l.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim() : '';
+}
+
+function parseByteLimit(raw) {
+  const s = String(raw || '').trim();
+  if (!s || s === 'max') return null;
+  const n = parseFloat(s);
+  if (!Number.isFinite(n) || n <= 0 || n > 9e18) return null;
+  return n;
+}
+
+function parseCgroupCpuQuota(lines) {
+  const cpuMax = parseTextLine(lines, '__CGROUP_CPU_MAX__ ');
+  if (cpuMax) {
+    const [quotaText, periodText] = cpuMax.split(/\s+/);
+    if (quotaText && quotaText !== 'max') {
+      const quota = parseFloat(quotaText);
+      const period = parseFloat(periodText);
+      if (Number.isFinite(quota) && Number.isFinite(period) && quota > 0 && period > 0) {
+        return quota / period;
+      }
+    }
+  }
+
+  const quota = parseNumericLine(lines, '__CGROUP_CPU_QUOTA_US__ ');
+  const period = parseNumericLine(lines, '__CGROUP_CPU_PERIOD_US__ ');
+  if (quota != null && period != null && quota > 0 && period > 0) return quota / period;
+  return null;
+}
+
+function countCpuset(cpus) {
+  const s = String(cpus || '').trim();
+  if (!s) return null;
+  let count = 0;
+  for (const part of s.split(',')) {
+    const m = part.trim().match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    const a = parseInt(m[1], 10);
+    const b = m[2] == null ? a : parseInt(m[2], 10);
+    if (Number.isFinite(a) && Number.isFinite(b) && b >= a) count += b - a + 1;
+  }
+  return count > 0 ? count : null;
+}
+
+function roundCores(v) {
+  if (v == null || !Number.isFinite(v)) return null;
+  return Math.round(v * 10) / 10;
+}
+
+// 解析 CPU_QUERY 的输出：优先 cgroup 限额/使用量，其次回退到整机 /proc 数据。
 function parseCpuOutput(stdout) {
   const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const cpuLines = lines.filter((l) => /^cpu\s/.test(l));
+  const cpuLines = [
+    parseTextLine(lines, '__CPU_A__ '),
+    parseTextLine(lines, '__CPU_B__ '),
+  ].filter((l) => /^cpu\s/.test(l));
   // /proc/stat 的 cpu 行：user nice system idle iowait irq softirq steal ...
   // idle 时间 = idle + iowait；利用率 = 1 - Δidle/Δtotal。
   const fields = (l) => l.split(/\s+/).slice(1).map((n) => parseFloat(n)).filter((n) => Number.isFinite(n));
+
+  const hostNproc = parseNumericLine(lines, '__NPROC__ ');
+  const quotaCores = parseCgroupCpuQuota(lines);
+  const cpusetCores = countCpuset(parseTextLine(lines, '__CGROUP_CPUSET__ '));
+  const coreCandidates = [quotaCores, cpusetCores, hostNproc].filter((n) => n != null && Number.isFinite(n) && n > 0);
+  const effectiveCores = coreCandidates.length ? Math.min(...coreCandidates) : null;
+
   let cpu = null;
-  if (cpuLines.length >= 2) {
+  const usageA = parseNumericLine(lines, '__CGROUP_CPU_USAGE_A__ ');
+  const usageB = parseNumericLine(lines, '__CGROUP_CPU_USAGE_B__ ');
+  const timeA = parseNumericLine(lines, '__TIME_A_NS__ ');
+  const timeB = parseNumericLine(lines, '__TIME_B_NS__ ');
+  if (usageA != null && usageB != null && timeA != null && timeB != null && effectiveCores) {
+    const usageDeltaUs = usageB - usageA;
+    const elapsedUs = (timeB - timeA) / 1000;
+    if (usageDeltaUs >= 0 && elapsedUs > 0) {
+      cpu = Math.max(0, Math.min(100, Math.round((usageDeltaUs / (elapsedUs * effectiveCores)) * 100)));
+    }
+  }
+  if (cpu == null && cpuLines.length >= 2) {
     const a = fields(cpuLines[0]);
     const b = fields(cpuLines[1]);
     const sum = (arr) => arr.reduce((s, n) => s + n, 0);
@@ -548,15 +1006,32 @@ function parseCpuOutput(stdout) {
   };
   const memTotalKb = memKb(/^MemTotal:/);
   const memAvailKb = memKb(/^MemAvailable:/);
-  const memTotal = memTotalKb != null ? Math.round(memTotalKb / 1024) : null;        // MiB
-  const memUsed = (memTotalKb != null && memAvailKb != null)
+  const hostMemTotalBytes = memTotalKb != null ? memTotalKb * 1024 : null;
+  const hostMemUsed = (memTotalKb != null && memAvailKb != null)
     ? Math.round((memTotalKb - memAvailKb) / 1024) : null;                            // MiB
+  const hostMemTotal = memTotalKb != null ? Math.round(memTotalKb / 1024) : null;      // MiB
+
+  const cgroupMemMax = parseByteLimit(parseTextLine(lines, '__CGROUP_MEM_MAX__ '));
+  const cgroupMemCurrent = parseByteLimit(parseTextLine(lines, '__CGROUP_MEM_CURRENT__ '));
+  const useCgroupMem = cgroupMemMax != null
+    && cgroupMemCurrent != null
+    && (hostMemTotalBytes == null || cgroupMemMax < hostMemTotalBytes);
+  const memTotal = useCgroupMem ? Math.round(cgroupMemMax / 1048576) : hostMemTotal;
+  const memUsedRaw = useCgroupMem ? Math.round(cgroupMemCurrent / 1048576) : hostMemUsed;
+  const memUsed = memTotal != null && memUsedRaw != null ? Math.min(memUsedRaw, memTotal) : memUsedRaw;
   const memPct = (memTotal && memUsed != null) ? Math.round((memUsed / memTotal) * 100) : null;
-  const loadLine = lines.find((l) => /^[0-9.]+\s+[0-9.]+\s+[0-9.]+/.test(l));
+  const loadLine = parseTextLine(lines, '__LOAD__ ');
   const load = loadLine ? parseFloat(loadLine.split(/\s+/)[0]) : null;
-  const coreLine = [...lines].reverse().find((l) => /^[0-9]+$/.test(l));
-  const cores = coreLine ? parseInt(coreLine, 10) : null;
-  return { cpu, memUsed, memTotal, memPct, load: Number.isFinite(load) ? load : null, cores };
+  return {
+    cpu,
+    memUsed,
+    memTotal,
+    memPct,
+    load: Number.isFinite(load) ? load : null,
+    cores: roundCores(effectiveCores),
+    cpuSource: quotaCores != null || usageA != null ? 'cgroup' : 'host',
+    memSource: useCgroupMem ? 'cgroup' : 'host',
+  };
 }
 
 function queryCpu(t) {
@@ -566,7 +1041,7 @@ function queryCpu(t) {
       env: childEnvWithoutProxy(),
       maxBuffer: 1 << 20,
     }, (err, stdout, stderr) => {
-      if (err) {
+      if (err && !stdout) {
         const reason = (stderr || err.message || '').trim().split(/\r?\n/)[0] || 'CPU 查询失败';
         cpuStats.set(t.id, { cpu: null, memUsed: null, memTotal: null, memPct: null, load: null, cores: null, queriedAt: new Date().toISOString(), error: reason });
         resolve();
@@ -714,15 +1189,27 @@ function startTunnel(t, opts = {}) {
   });
 }
 
-function stopTunnel(t) {
-  if (t.pid && isAlive(t.pid)) {
-    try { process.kill(-t.pid, 'SIGTERM'); }
-    catch (_) {
-      try { process.kill(t.pid, 'SIGTERM'); } catch (_) {}
-    }
+async function stopTunnel(t, opts = {}) {
+  if (!t.pid || !isAlive(t.pid)) {
+    t.pid = null;
+    t.status = 'stopped';
+    return { ok: true };
   }
+
+  const result = await stopPid(t.pid, {
+    useSudo: !!t.useSudo,
+    sudoPassword: opts.sudoPassword,
+    group: true,
+  });
+  if (!result.ok) return result;
+
   t.pid = null;
   t.status = 'stopped';
+  t.startedAt = null;
+  health.delete(t.id);
+  gpuStats.delete(t.id);
+  cpuStats.delete(t.id);
+  return { ok: true };
 }
 
 function readLogTail(logPath, bytes) {
@@ -869,7 +1356,15 @@ const server = http.createServer(async (req, res) => {
       if (!t) return sendJson(res, 404, { error: '未找到该隧道' });
 
       if (method === 'DELETE') {
-        stopTunnel(t);
+        const stopResult = await stopTunnel(t);
+        if (!stopResult.ok) {
+          saveTunnels(tunnels);
+          return sendJson(res, stopResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+            code: stopResult.code,
+            error: stopResult.reason,
+            tunnel: publicView([t])[0],
+          });
+        }
         const next = tunnels.filter((x) => x.id !== id);
         saveTunnels(next);
         return sendJson(res, 200, { ok: true });
@@ -902,16 +1397,70 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (method === 'POST' && action === 'stop') {
-        stopTunnel(t);
+        const body = await readBody(req);
+        const stopResult = await stopTunnel(t, { sudoPassword: body.sudoPassword });
         saveTunnels(tunnels);
+        if (!stopResult.ok) {
+          return sendJson(res, stopResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+            code: stopResult.code,
+            error: stopResult.reason,
+            tunnel: publicView([t])[0],
+          });
+        }
         return sendJson(res, 200, { tunnel: publicView([t])[0] });
       }
 
       if (method === 'POST' && (action === 'start' || action === 'restart')) {
         const body = await readBody(req);
-        if (action === 'restart') stopTunnel(t);
+        if (action === 'restart') {
+          const stopResult = await stopTunnel(t, { sudoPassword: body.sudoPassword });
+          saveTunnels(tunnels);
+          if (!stopResult.ok) {
+            return sendJson(res, stopResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+              code: stopResult.code,
+              error: stopResult.reason,
+              tunnel: publicView([t])[0],
+            });
+          }
+        }
         if (t.status === 'running' && isAlive(t.pid)) {
           return sendJson(res, 200, { tunnel: publicView([t])[0] });
+        }
+        const portInfo = await getPortOccupants(t.port, t);
+        if (portInfo.occupied) {
+          const portStop = classifyPortOccupants(t, portInfo);
+          if (!body.stopOccupiedPort) {
+            return sendJson(res, 409, {
+              code: 'PORT_IN_USE',
+              error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.canStop ? '' : portStop.reason}`,
+              port: t.port,
+              canStopOccupiedPort: portStop.canStop,
+              processes: publicPortProcesses(portInfo),
+            });
+          }
+          if (!portStop.canStop) {
+            return sendJson(res, 409, {
+              code: 'PORT_IN_USE',
+              error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.reason}`,
+              port: t.port,
+              canStopOccupiedPort: false,
+              processes: publicPortProcesses(portInfo),
+            });
+          }
+          const stopPortResult = await stopPortOccupants(t.port, {
+            tunnel: t,
+            sudoPassword: body.sudoPassword,
+            canStopProcess: (p) => isTunnelPortProcess(t, p),
+          });
+          if (!stopPortResult.ok) {
+            return sendJson(res, stopPortResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+              code: stopPortResult.code,
+              error: stopPortResult.reason,
+              port: t.port,
+              canStopOccupiedPort: stopPortResult.code === 'SUDO_REQUIRED',
+              processes: publicPortProcesses(stopPortResult.portInfo || portInfo),
+            });
+          }
         }
         if (!t.skipDirectCheck) {
           const gate = await directConnectionGate(t.url);
@@ -1566,7 +2115,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div class="field">
         <label for="sudo-password">sudo/root 密码</label>
         <input id="sudo-password" type="password" autocomplete="current-password" placeholder="不会保存">
-        <div class="hint">用于本次启动或重启 sudo rtunnel；请求完成后前端会清空输入框。</div>
+        <div class="hint">用于本次启动、停止或重启 sudo rtunnel；请求完成后前端会清空输入框。</div>
       </div>
     </div>
     <footer class="modal-footer">
@@ -1625,7 +2174,12 @@ async function api(url, opts) {
   const res = await fetch(url, opts);
   let data = {};
   try { data = await res.json(); } catch (_) {}
-  if (!res.ok) throw new Error(data.error || ('请求失败 ' + res.status));
+  if (!res.ok) {
+    const err = new Error(data.error || ('请求失败 ' + res.status));
+    err.status = res.status;
+    Object.assign(err, data);
+    throw err;
+  }
   return data;
 }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -1636,7 +2190,7 @@ const state = {
   expanded: new Set(),  // 展开 GPU 明细的 id
 };
 let modalMode = null;    // null | 'create' | { mode: 'edit', id }
-let sudoAction = null;   // null | { id, act }
+let sudoAction = null;   // null | { id, act, stopOccupiedPort }
 
 // ---------- 数据加工：过滤 / 分组 / 排序 ----------
 // 过滤无关 GPU：memTotal=0 / null（CPU-only 或 nvidia-smi 返回异常）
@@ -1776,7 +2330,7 @@ function cpuCellHtml(t) {
     return '<span class="gpu-info-dim">—</span>';
   }
   const parts = [];
-  parts.push(\`<span class="gpu-model">🖥 CPU\${c.cores ? ' · ' + c.cores + ' 核' : ''}</span>\`);
+  parts.push(\`<span class="gpu-model">🖥 CPU\${c.cores ? ' · 可用 ' + c.cores : ''}</span>\`);
   if (c.cpu != null) {
     parts.push(\`<span class="metric-inline">利用率 <b>\${c.cpu}%</b>\${meterHtml(c.cpu, true)}</span>\`);
   }
@@ -1832,7 +2386,7 @@ function cpuDetailHtml(t) {
   if (c && (c.cpu != null || c.memPct != null)) {
     const gb = (mib) => (mib == null ? '—' : (mib / 1024).toFixed(1));
     return \`<table class="gpu-detail">
-      <thead><tr><th>CPU 利用率</th><th>核数</th><th>内存</th><th>1 分钟负载</th></tr></thead>
+      <thead><tr><th>CPU 利用率</th><th>可用 CPU</th><th>内存</th><th>1 分钟负载</th></tr></thead>
       <tbody><tr>
         <td><span class="metric-inline">\${c.cpu == null ? '—' : c.cpu + '%'}\${meterHtml(c.cpu, true)}</span></td>
         <td>\${c.cores == null ? '—' : c.cores}</td>
@@ -2011,7 +2565,8 @@ async function submitForm(opts) {
           openSudoPasswordModal(saved.tunnel, 'restart');
           return;
         }
-        await runTunnelAction(id, 'restart');
+        const result = await runActionWithPortPrompt(id, 'restart');
+        if (!result) return;
         toast('已保存并用新配置重启');
       } else {
         toast('已保存');
@@ -2022,20 +2577,26 @@ async function submitForm(opts) {
   } catch (e) { toast(e.message, true); }
 }
 
-async function runTunnelAction(id, act, sudoPassword) {
+async function runTunnelAction(id, act, sudoPassword, extraBody) {
   const opts = { method: 'POST' };
-  if (act === 'start' || act === 'restart' || sudoPassword) {
+  const body = Object.assign({}, extraBody || {});
+  if (sudoPassword) body.sudoPassword = sudoPassword;
+  if (act === 'start' || act === 'restart' || act === 'stop' || Object.keys(body).length) {
     opts.headers = {'Content-Type':'application/json'};
-    opts.body = JSON.stringify(sudoPassword ? { sudoPassword } : {});
+    opts.body = JSON.stringify(body);
   }
   return api('/api/tunnels/' + id + '/' + act, opts);
 }
 
-function openSudoPasswordModal(t, act) {
-  sudoAction = { id: t.id, act };
-  $('#modal-sudo-title').textContent = (act === 'restart' ? '重启' : '启动') + ' · ' + t.name;
+function actionLabel(act) {
+  return act === 'restart' ? '重启' : act === 'stop' ? '停止' : '启动';
+}
+
+function openSudoPasswordModal(t, act, opts) {
+  sudoAction = { id: t.id, act, stopOccupiedPort: !!(opts && opts.stopOccupiedPort) };
+  $('#modal-sudo-title').textContent = ((opts && opts.title) || actionLabel(act)) + ' · ' + t.name;
   $('#sudo-password').value = '';
-  $('#sudo-submit').textContent = act === 'restart' ? '重启' : '启动';
+  $('#sudo-submit').textContent = actionLabel(act);
   $('#modal-sudo').hidden = false;
   setTimeout(() => $('#sudo-password').focus(), 30);
 }
@@ -2043,6 +2604,36 @@ function closeSudoPasswordModal() {
   $('#modal-sudo').hidden = true;
   $('#sudo-password').value = '';
   sudoAction = null;
+}
+
+function portInUseDetails(e) {
+  const procs = (e.processes || []).map((p) => {
+    const cmd = p.command || '进程';
+    return cmd + ' PID ' + p.pid;
+  }).join('，');
+  return procs ? '占用进程：' + procs : '无法识别占用进程。';
+}
+
+async function runActionWithPortPrompt(id, act, sudoPassword, extraBody) {
+  try {
+    return await runTunnelAction(id, act, sudoPassword, extraBody);
+  } catch (e) {
+    if (e.code !== 'PORT_IN_USE') throw e;
+    if (!e.canStopOccupiedPort) throw e;
+    const t = state.tunnels.find((x) => x.id === id);
+    const msg = (e.error || '本地端口已被占用。') + '\\n' + portInUseDetails(e)
+      + '\\n\\n是否停止占用该端口的旧进程后重试？';
+    if (!confirm(msg)) return null;
+    try {
+      return await runTunnelAction(id, act, sudoPassword, Object.assign({}, extraBody || {}, { stopOccupiedPort: true }));
+    } catch (err) {
+      if (err.code === 'SUDO_REQUIRED' && t) {
+        openSudoPasswordModal(t, act, { stopOccupiedPort: true, title: '停止旧进程后' + actionLabel(act) });
+        return null;
+      }
+      throw err;
+    }
+  }
 }
 
 // ---------- 模态：日志 ----------
@@ -2115,12 +2706,13 @@ document.addEventListener('click', async (ev) => {
     btn.disabled = true;
     try {
       const t = state.tunnels.find((x) => x.id === id);
-      if (t && t.useSudo && (act === 'start' || act === 'restart')) {
+      if (t && t.useSudo && (act === 'start' || act === 'stop' || act === 'restart')) {
         btn.disabled = false;
         openSudoPasswordModal(t, act);
         return;
       }
-      await runTunnelAction(id, act);
+      const result = await runActionWithPortPrompt(id, act);
+      if (!result) { btn.disabled = false; return; }
       toast(act === 'start' ? '已启动' : act === 'stop' ? '已停止' : '已重启');
       refresh();
     } catch (e) { toast(e.message, true); btn.disabled = false; }
@@ -2149,11 +2741,12 @@ $('#sudo-submit').addEventListener('click', async () => {
   if (!sudoAction) return;
   const pwd = $('#sudo-password').value;
   if (!pwd) return toast('请填写 sudo/root 密码', true);
-  const { id, act } = sudoAction;
+  const { id, act, stopOccupiedPort } = sudoAction;
   $('#sudo-submit').disabled = true;
   try {
-    await runTunnelAction(id, act, pwd);
-    toast(act === 'restart' ? '已重启' : '已启动');
+    const result = await runActionWithPortPrompt(id, act, pwd, stopOccupiedPort ? { stopOccupiedPort: true } : null);
+    if (!result) return;
+    toast(act === 'restart' ? '已重启' : act === 'stop' ? '已停止' : '已启动');
     closeSudoPasswordModal();
     refresh();
   } catch (e) {
