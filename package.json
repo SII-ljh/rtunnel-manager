@@ -12,8 +12,10 @@
     "sign:deps": "bash scripts/sign-deps.sh",
     "sign:app": "bash scripts/sign-app.sh",
     "postinstall": "bash scripts/sign-deps.sh",
-    "dist": "npm run icon && electron-builder --mac && npm run sign:app",
-    "dist:dir": "npm run icon && electron-builder --mac dir && npm run sign:app"
+    "dist": "npm run icon && electron-builder --mac --universal && npm run sign:app -- dist/mac-universal/rtunnel.app",
+    "dist:dir": "npm run icon && electron-builder --mac dir --universal && npm run sign:app -- dist/mac-universal/rtunnel.app",
+    "dist:mac:intel": "npm run icon && electron-builder --mac --x64 && npm run sign:app -- dist/mac/rtunnel.app",
+    "dist:mac:arm": "npm run icon && electron-builder --mac --arm64 && npm run sign:app -- dist/mac-arm64/rtunnel.app"
   },
   "devDependencies": {
     "electron": "^33.2.0",
@@ -35,8 +37,8 @@
       "icon": "build/icon.icns",
       "category": "public.app-category.developer-tools",
       "target": [
-        { "target": "dir", "arch": ["arm64"] },
-        { "target": "dmg", "arch": ["arm64"] }
+        { "target": "dir", "arch": ["universal"] },
+        { "target": "dmg", "arch": ["universal"] }
       ],
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
