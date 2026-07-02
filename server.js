@@ -339,11 +339,20 @@ async function waitForExit(pid, timeoutMs = 2000) {
 
 function signalPid(pid, signal, group) {
   try {
-    process.kill(group ? -pid : pid, signal);
+    process.kill(group ? -pid : pid, nodeSignalName(signal));
     return { ok: true };
   } catch (e) {
     return { ok: false, code: e.code || 'KILL_FAILED', reason: e.message };
   }
+}
+
+function nodeSignalName(signal) {
+  const s = String(signal || '').toUpperCase();
+  return s.startsWith('SIG') ? s : `SIG${s}`;
+}
+
+function killCommandSignalName(signal) {
+  return nodeSignalName(signal).replace(/^SIG/, '');
 }
 
 function sudoKill(pid, signal, opts = {}) {
@@ -354,7 +363,7 @@ function sudoKill(pid, signal, opts = {}) {
       return;
     }
     const target = opts.group ? `-${pid}` : String(pid);
-    const child = spawn('/usr/bin/sudo', ['-S', '-p', '', '--', '/bin/kill', `-${signal}`, '--', target], {
+    const child = spawn('/usr/bin/sudo', ['-S', '-p', '', '--', '/bin/kill', `-${killCommandSignalName(signal)}`, '--', target], {
       stdio: ['pipe', 'ignore', 'pipe'],
       env: childEnvWithoutProxy(),
       cwd: os.homedir(),
